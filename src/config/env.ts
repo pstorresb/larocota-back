@@ -11,6 +11,9 @@ const schema = z.object({
   UPLOAD_DIR: z.string().default("./media"),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(8_388_608),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
+  GOOGLE_CLIENT_ID: z.string().min(10).optional(),
+  GOOGLE_CLIENT_SECRET: z.string().min(10).optional(),
+  GOOGLE_REDIRECT_URI: z.string().url().optional(),
 });
 
 export type AppEnv = z.infer<typeof schema>;
