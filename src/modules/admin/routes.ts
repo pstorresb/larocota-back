@@ -7,6 +7,7 @@ import { deleteUploadedProductImage, storeProductImage } from "../../common/stor
 import { loadModifierGroups } from "../catalog/configuration.js";
 import { getSessionUser } from "../auth/session.js";
 import { assertTransition, orderStatuses, type OrderStatus } from "../orders/state-machine.js";
+import { sendOrderStatusEmail } from "../../common/email/resend.js";
 
 const categorySchema = z.object({ name: z.string().trim().min(2).max(80), slug: z.string().regex(/^[a-z0-9-]+$/).max(80), description: z.string().max(500).optional(), sortOrder: z.number().int().min(0).default(0), isActive: z.boolean().default(true) });
 const productSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/).max(120), shortDescription: z.string().trim().min(5).max(300), description: z.string().max(2000).optional(), imageAlt: z.string().max(180).optional(), badge: z.string().max(40).optional(), basePrice: z.number().min(0).max(10000), taxRate: z.number().min(0).max(1), sortOrder: z.number().int().min(0).default(0), isActive: z.boolean().default(true) });
@@ -248,19 +249,21 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       const parsed = z.object({ status: z.enum(orderStatuses), publicNote: z.string().max(500).optional(), privateNote: z.string().max(1000).optional() }).safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Estado u observación inválidos." });
       const updated = await sql.begin(async (tx) => {
-        const [order] = await tx<{ id: string; status: OrderStatus }[]>`select id, status from orders where id = ${request.params.orderId} for update`;
+        const [order] = await tx<{ id: string; status: OrderStatus; orderNumber: string; fulfillmentType: string; contactSnapshot: { email: string; firstName: string } }[]>`select id, status, order_number, fulfillment_type, contact_snapshot from orders where id = ${request.params.orderId} for update`;
         if (!order) throw Object.assign(new Error("Pedido no encontrado."), { statusCode: 404 });
         assertTransition(order.status, parsed.data.status);
         const [result] = await tx`
           update orders set status = ${parsed.data.status}, admin_public_note = coalesce(${parsed.data.publicNote ?? null}, admin_public_note), admin_private_note = coalesce(${parsed.data.privateNote ?? null}, admin_private_note), delivered_at = case when ${parsed.data.status} = 'delivered' then now() else delivered_at end, cancelled_at = case when ${parsed.data.status} = 'cancelled' then now() else cancelled_at end
           where id = ${order.id} returning id, order_number, status, updated_at
         `;
+        if (!result) throw new Error("Order status update failed");
         await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note, private_note) values (${order.id}, ${order.status}, ${parsed.data.status}, ${user.id}, ${parsed.data.publicNote ?? null}, ${parsed.data.privateNote ?? null})`;
         await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'order', ${order.id}, 'status_changed', ${tx.json({ status: order.status })}, ${tx.json({ status: parsed.data.status })})`;
         if (parsed.data.status === "cancelled") await tx`update stock_reservations set status = 'released' where order_id = ${order.id} and status in ('reserved', 'committed')`;
-        return result;
+        return { result, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: parsed.data.status, fulfillmentType: order.fulfillmentType } };
       });
-      return { order: updated };
+      try { await sendOrderStatusEmail(env, updated.notification); } catch (error) { request.log.error({ err: error, orderId: updated.result.id }, "Could not send order status email"); }
+      return { order: updated.result };
     });
 
     app.post<{ Params: { proofId: string } }>("/admin/payments/:proofId/review", async (request, reply) => {
@@ -271,7 +274,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         const [proof] = await tx<{ id: string; orderId: string; status: string }[]>`select id, order_id, status from payment_proofs where id = ${request.params.proofId} for update`;
         if (!proof) throw Object.assign(new Error("Comprobante no encontrado."), { statusCode: 404 });
         if (proof.status !== "under_review") throw Object.assign(new Error("El comprobante ya fue revisado."), { statusCode: 409 });
-        const [order] = await tx<{ id: string; status: OrderStatus }[]>`select id, status from orders where id = ${proof.orderId} for update`;
+        const [order] = await tx<{ id: string; status: OrderStatus; orderNumber: string; fulfillmentType: string; contactSnapshot: { email: string; firstName: string } }[]>`select id, status, order_number, fulfillment_type, contact_snapshot from orders where id = ${proof.orderId} for update`;
         if (!order || order.status !== "payment_review") throw Object.assign(new Error("El pedido no está listo para revisión."), { statusCode: 409 });
         const approved = parsed.data.decision === "approve";
         const nextStatus: OrderStatus = approved ? "confirmed" : "payment_rejected";
@@ -281,9 +284,12 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note) values (${order.id}, ${order.status}, ${nextStatus}, ${user.id}, ${approved ? 'Pago confirmado.' : reason})`;
         await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'payment_proof', ${proof.id}, ${approved ? 'approved' : 'rejected'}, ${tx.json({ reason })})`;
         if (approved) await tx`update stock_reservations set status = 'committed' where order_id = ${order.id} and status = 'reserved'`;
-        return { proofId: proof.id, orderId: order.id, orderStatus: nextStatus };
+        return { proofId: proof.id, orderId: order.id, orderStatus: nextStatus, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: nextStatus, fulfillmentType: order.fulfillmentType } };
       });
-      return { result };
+      if (result.orderStatus === "confirmed") {
+        try { await sendOrderStatusEmail(env, result.notification); } catch (error) { request.log.error({ err: error, orderId: result.orderId }, "Could not send payment approval email"); }
+      }
+      return { result: { proofId: result.proofId, orderId: result.orderId, orderStatus: result.orderStatus } };
     });
 
     app.post("/admin/categories", async (request, reply) => {
