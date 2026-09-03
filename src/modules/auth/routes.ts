@@ -1,5 +1,5 @@
 import { hash as hashPassword, verify as verifyPassword } from "@node-rs/argon2";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { AppEnv } from "../../config/env.js";
@@ -9,6 +9,7 @@ import { getSessionUser, tokenHash } from "./session.js";
 
 const credentialsSchema = z.object({ email: z.string().trim().toLowerCase().email(), password: z.string().min(10).max(128) });
 const registerSchema = credentialsSchema.extend({ firstName: z.string().trim().min(2).max(80), lastName: z.string().trim().min(2).max(80), phone: z.string().trim().min(7).max(24).optional() });
+const verifyRegistrationSchema = z.object({ email: z.string().trim().toLowerCase().email(), code: z.string().regex(/^\d{6}$/) });
 const profileSchema = z.object({ firstName: z.string().trim().min(2).max(80), lastName: z.string().trim().min(2).max(80), phone: z.string().trim().min(7).max(24) });
 const googleKeys = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"));
 
@@ -20,6 +21,10 @@ function sameToken(left: string, right: string) {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function codeHash(code: string) {
+  return createHash("sha256").update(code).digest("hex");
 }
 
 function publicUser(user: { id: string; email: string; firstName: string; lastName: string; phone: string | null; role: string }) {
@@ -49,18 +54,77 @@ export function authRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       return reply.redirect(`${env.FRONTEND_ORIGIN}/login?google_error=${encodeURIComponent(code)}`);
     }
 
-    app.post("/auth/register", { config: { rateLimit: { max: 8, timeWindow: "15 minutes" } } }, async (request, reply) => {
+    async function sendSignupCode(email: string, code: string) {
+      if (!env.RESEND_API_KEY) throw new Error("Email service is not configured");
+      const response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: env.EMAIL_FROM,
+          to: [email],
+          subject: `${code} es tu código para La Rocota`,
+          text: `Tu código de confirmación para crear tu cuenta en La Rocota es: ${code}. Vence en 10 minutos. Si no lo solicitaste, puedes ignorar este correo.`,
+          html: `<div style="font-family:Arial,sans-serif;color:#211f1c"><p>Hola,</p><p>Tu código de confirmación para crear tu cuenta en <strong>La Rocota</strong> es:</p><p style="font-size:32px;font-weight:700;letter-spacing:8px;margin:24px 0">${code}</p><p>Vence en 10 minutos. Si no lo solicitaste, puedes ignorar este correo.</p></div>`,
+        }),
+      });
+      if (!response.ok) throw new Error(`Resend rejected email (${response.status})`);
+    }
+
+    app.post("/auth/register/request-code", { config: { rateLimit: { max: 5, timeWindow: "15 minutes" } } }, async (request, reply) => {
       const parsed = registerSchema.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa los datos de registro." });
       const existing = await sql`select id from users where email = ${parsed.data.email}`;
-      if (existing.length) return reply.code(409).send({ code: "ACCOUNT_UNAVAILABLE", message: "No pudimos crear la cuenta con esos datos." });
+      if (existing.length) return reply.code(409).send({ code: "ACCOUNT_EXISTS", message: "Ya existe una cuenta con este correo. Inicia sesión o usa Google." });
+      const [pending] = await sql<{ lastSentAt: Date; sendCount: number }[]>`
+        select last_sent_at, send_count from email_signup_verifications where email = ${parsed.data.email} and expires_at > now()
+      `;
+      if (pending && Date.now() - new Date(pending.lastSentAt).getTime() < 60_000) {
+        return reply.code(429).send({ code: "CODE_RECENTLY_SENT", message: "Espera un minuto antes de solicitar otro código." });
+      }
+      if (pending && pending.sendCount >= 3) return reply.code(429).send({ code: "CODE_LIMIT_REACHED", message: "Inténtalo nuevamente en unos minutos." });
+      if (!env.RESEND_API_KEY) return reply.code(503).send({ code: "EMAIL_UNAVAILABLE", message: "El correo de confirmación todavía no está configurado." });
       const passwordHash = await hashPassword(parsed.data.password, { memoryCost: 19_456, timeCost: 2, parallelism: 1 });
+      const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
+      const expiresAt = new Date(Date.now() + 10 * 60_000);
+      await sql`
+        insert into email_signup_verifications (email, password_hash, first_name, last_name, phone, code_hash, expires_at, attempts, send_count, last_sent_at)
+        values (${parsed.data.email}, ${passwordHash}, ${parsed.data.firstName}, ${parsed.data.lastName}, ${parsed.data.phone ?? null}, ${codeHash(code)}, ${expiresAt}, 0, 1, now())
+        on conflict (email) do update set password_hash = excluded.password_hash, first_name = excluded.first_name, last_name = excluded.last_name, phone = excluded.phone, code_hash = excluded.code_hash, expires_at = excluded.expires_at, attempts = 0, send_count = email_signup_verifications.send_count + 1, last_sent_at = now()
+      `;
+      try {
+        await sendSignupCode(parsed.data.email, code);
+      } catch (error) {
+        request.log.error({ err: error }, "Could not send signup verification email");
+        await sql`delete from email_signup_verifications where email = ${parsed.data.email} and code_hash = ${codeHash(code)}`;
+        return reply.code(503).send({ code: "EMAIL_DELIVERY_FAILED", message: "No pudimos enviar el código. Inténtalo nuevamente." });
+      }
+      return reply.code(202).send({ expiresInSeconds: 600 });
+    });
+
+    app.post("/auth/register/verify", { config: { rateLimit: { max: 8, timeWindow: "15 minutes" } } }, async (request, reply) => {
+      const parsed = verifyRegistrationSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Ingresa el código de seis dígitos." });
+      const [pending] = await sql<{ email: string; passwordHash: string; firstName: string; lastName: string; phone: string | null; codeHash: string; expiresAt: Date; attempts: number }[]>`
+        select email, password_hash, first_name, last_name, phone, code_hash, expires_at, attempts
+        from email_signup_verifications where email = ${parsed.data.email}
+      `;
+      if (!pending || new Date(pending.expiresAt).getTime() < Date.now()) {
+        if (pending) await sql`delete from email_signup_verifications where email = ${parsed.data.email}`;
+        return reply.code(400).send({ code: "CODE_EXPIRED", message: "El código expiró. Solicita uno nuevo." });
+      }
+      if (pending.attempts >= 5) return reply.code(429).send({ code: "CODE_ATTEMPTS_EXCEEDED", message: "Se agotaron los intentos. Solicita un código nuevo." });
+      if (!sameToken(codeHash(parsed.data.code), pending.codeHash)) {
+        await sql`update email_signup_verifications set attempts = attempts + 1 where email = ${parsed.data.email}`;
+        return reply.code(400).send({ code: "INVALID_CODE", message: "El código no es correcto. Revisa el correo e inténtalo nuevamente." });
+      }
       const [user] = await sql<{ id: string; email: string; firstName: string; lastName: string; phone: string | null; role: string }[]>`
-        insert into users (email, password_hash, first_name, last_name, phone)
-        values (${parsed.data.email}, ${passwordHash}, ${parsed.data.firstName}, ${parsed.data.lastName}, ${parsed.data.phone ?? null})
+        insert into users (email, password_hash, first_name, last_name, phone, email_verified_at)
+        values (${pending.email}, ${pending.passwordHash}, ${pending.firstName}, ${pending.lastName}, ${pending.phone}, now())
+        on conflict (email) do nothing
         returning id, email, first_name, last_name, phone, role
       `;
-      if (!user) throw new Error("User creation failed");
+      if (!user) return reply.code(409).send({ code: "ACCOUNT_EXISTS", message: "Ya existe una cuenta con este correo. Inicia sesión." });
+      await sql`delete from email_signup_verifications where email = ${pending.email}`;
       await createSession(reply, user.id);
       return reply.code(201).send({ user: publicUser(user) });
     });
