@@ -21,7 +21,7 @@ const quoteSchema = z.object({
 const checkoutSchema = z.object({
   cycleId: z.string().uuid(),
   fulfillmentType: z.enum(["pickup", "delivery"]),
-  contact: z.object({ email: z.string().email(), firstName: z.string().min(2).max(80), lastName: z.string().min(2).max(80), phone: z.string().min(7).max(24) }),
+  contact: z.object({ email: z.string().email(), firstName: z.string().min(2).max(80), lastName: z.string().min(2).max(80), phone: z.string().trim().regex(/^0\d{9}$/, "El teléfono debe tener 10 dígitos en formato 0XXXXXXXXX.") }),
   address: z.object({ addressLine: z.string().trim().min(8).max(300), requestedDeliveryTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), sector: z.string().trim().max(120), reference: z.string().trim().max(500), locationText: z.string().trim().max(500).optional(), latitude: z.number().min(-90).max(90).optional(), longitude: z.number().min(-180).max(180).optional() }),
   customerNotes: z.string().max(500).optional(),
   items: z.array(z.object({ productId: z.string().uuid(), quantity: z.number().int().min(1).max(20), selections: selectionsSchema, customerNote: z.string().max(240).optional() })).min(1).max(30),

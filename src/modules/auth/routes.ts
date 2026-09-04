@@ -9,11 +9,12 @@ import { getSessionUser, tokenHash } from "./session.js";
 import { sendPinEmail } from "../../common/email/resend.js";
 
 const credentialsSchema = z.object({ email: z.string().trim().toLowerCase().email(), password: z.string().min(10).max(128) });
-const registerSchema = credentialsSchema.extend({ firstName: z.string().trim().min(2).max(80), lastName: z.string().trim().min(2).max(80), phone: z.string().trim().min(7).max(24).optional() });
+const ecuadorPhoneSchema = z.string().trim().regex(/^0\d{9}$/, "El teléfono debe tener 10 dígitos en formato 0XXXXXXXXX.");
+const registerSchema = credentialsSchema.extend({ firstName: z.string().trim().min(2).max(80), lastName: z.string().trim().min(2).max(80), phone: ecuadorPhoneSchema.optional() });
 const verifyRegistrationSchema = z.object({ email: z.string().trim().toLowerCase().email(), code: z.string().regex(/^\d{6}$/) });
 const resetRequestSchema = z.object({ email: z.string().trim().toLowerCase().email() });
 const resetVerifySchema = resetRequestSchema.extend({ code: z.string().regex(/^\d{6}$/), password: z.string().min(10).max(128) });
-const profileSchema = z.object({ firstName: z.string().trim().min(2).max(80), lastName: z.string().trim().min(2).max(80), phone: z.string().trim().min(7).max(24) });
+const profileSchema = z.object({ firstName: z.string().trim().min(2).max(80), lastName: z.string().trim().min(2).max(80), phone: ecuadorPhoneSchema });
 const googleKeys = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"));
 
 function safeNext(value: unknown) {
