@@ -11,9 +11,15 @@ import { catalogRoutes } from "./modules/catalog/routes.js";
 import { orderRoutes } from "./modules/orders/routes.js";
 import { paymentRoutes } from "./modules/payments/routes.js";
 import { adminRoutes } from "./modules/admin/routes.js";
+import { settingsRoutes } from "./modules/settings/routes.js";
 
 export async function buildApp(env: AppEnv) {
-  const app = Fastify({ logger: { level: env.LOG_LEVEL }, bodyLimit: env.MAX_UPLOAD_BYTES });
+  const app = Fastify({
+    logger: { level: env.LOG_LEVEL },
+    bodyLimit: env.MAX_UPLOAD_BYTES,
+    // nginx terminates TLS and forwards the client address; without this every rate limit keys on 127.0.0.1.
+    trustProxy: env.TRUST_PROXY,
+  });
   const sql = createDatabase(env);
   await app.register(helmet);
   await app.register(cors, { origin: env.FRONTEND_ORIGIN, credentials: true, methods: ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"] });
@@ -30,14 +36,23 @@ export async function buildApp(env: AppEnv) {
   await app.register(catalogRoutes(sql, env), { prefix: "/api/v1" });
   await app.register(orderRoutes(sql, env), { prefix: "/api/v1" });
   await app.register(paymentRoutes(sql, env), { prefix: "/api/v1" });
+  await app.register(settingsRoutes(sql, env), { prefix: "/api/v1" });
   await app.register(adminRoutes(sql, env), { prefix: "/api/v1" });
 
   app.setErrorHandler((error, request, reply) => {
-    request.log.error({ err: error }, "request failed");
     const appError = error as Error & { statusCode?: number };
     const statusCode = appError.statusCode && appError.statusCode < 500 ? appError.statusCode : 500;
+    if (statusCode >= 500) request.log.error({ err: error }, "request failed");
+    else request.log.warn({ err: error }, "request rejected");
     return reply.code(statusCode).send({ code: statusCode === 500 ? "INTERNAL_ERROR" : "REQUEST_ERROR", message: statusCode === 500 ? "No pudimos procesar la solicitud." : appError.message, requestId: request.id });
   });
   app.addHook("onClose", async () => { await sql.end(); });
+  app.decorate("sql", sql);
   return app;
+}
+
+declare module "fastify" {
+  interface FastifyInstance {
+    sql: ReturnType<typeof createDatabase>;
+  }
 }

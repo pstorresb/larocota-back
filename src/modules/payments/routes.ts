@@ -23,13 +23,26 @@ export function paymentRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       const stored = await storeProof({ buffer, originalName: file.filename, uploadDir: env.UPLOAD_DIR });
       try {
         const proof = await sql.begin(async (tx) => {
+          const [lockedOrder] = await tx<{ status: string }[]>`
+            select status from orders where id = ${order.id} for update
+          `;
+          if (!lockedOrder || !['payment_pending', 'payment_rejected'].includes(lockedOrder.status)) {
+            throw Object.assign(new Error("Este pedido no admite otro comprobante."), { statusCode: 409 });
+          }
+          const [expired] = await tx`
+            select id from stock_reservations where order_id = ${order.id}
+              and status = 'reserved' and expires_at <= now() limit 1
+          `;
+          if (expired) throw Object.assign(new Error("El plazo de pago de este pedido venció."), { statusCode: 409 });
           await tx`update payment_proofs set status = 'superseded', updated_at = now() where order_id = ${order.id} and status in ('pending', 'under_review', 'rejected')`;
           const [created] = await tx<{ id: string; status: string; createdAt: Date }[]>`
             insert into payment_proofs (order_id, status, original_name, stored_name, mime_type, size_bytes, sha256)
             values (${order.id}, 'under_review', ${stored.originalName}, ${stored.storedName}, ${stored.mimeType}, ${stored.sizeBytes}, ${stored.sha256}) returning id, status, created_at
           `;
           await tx`update orders set status = 'payment_review', updated_at = now() where id = ${order.id}`;
-          await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note) values (${order.id}, ${order.status}, 'payment_review', ${user.id}, 'Comprobante recibido y en revisión.')`;
+          // The proof is in; the reservation must not expire while an admin reviews it.
+          await tx`update stock_reservations set expires_at = null where order_id = ${order.id} and status = 'reserved'`;
+          await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note) values (${order.id}, ${lockedOrder.status}, 'payment_review', ${user.id}, 'Comprobante recibido y en revisión.')`;
           return created;
         });
         return reply.code(201).send({ proof });

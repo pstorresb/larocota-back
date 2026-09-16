@@ -7,10 +7,13 @@ import { loadModifierGroups } from "./configuration.js";
 export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
   return async (app) => {
     async function activeCatalog() {
+      // An open cycle inside its window wins; otherwise the next scheduled one is shown as "coming soon" (isOpen = false).
       const [cycle] = await sql`
-        select id, name, status, opens_at, closes_at, fulfillment_at, public_message
+        select id, name, status, opens_at, closes_at, fulfillment_at, public_message, fulfillment_modes,
+          (status = 'open' and opens_at <= now() and closes_at > now()) as is_open
         from sales_cycles
-        where status in ('open', 'scheduled')
+        where (status = 'open' and opens_at <= now() and closes_at > now())
+           or (status = 'scheduled' and closes_at > now())
         order by case when status = 'open' then 0 else 1 end, opens_at
         limit 1
       `;
@@ -20,7 +23,7 @@ export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
           p.image_key, p.image_alt, p.badge, p.updated_at,
           c.id as category_id, c.name as category, c.slug as category_slug,
           cp.capacity, cp.price_override, cp.is_available,
-          greatest(coalesce(cp.capacity, 2147483647) - coalesce(sum(sr.quantity) filter (where sr.status in ('reserved', 'committed')), 0), 0)::int as available
+          greatest(coalesce(cp.capacity, 2147483647) - coalesce(sum(sr.quantity) filter (where sr.status = 'committed' or (sr.status = 'reserved' and (sr.expires_at is null or sr.expires_at > now()))), 0), 0)::int as available
         from cycle_products cp
         join products p on p.id = cp.product_id and p.is_active
         join categories c on c.id = p.category_id and c.is_active
@@ -58,7 +61,8 @@ export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       return catalog.cycle;
     });
     app.get("/catalog", activeCatalog);
-    app.get<{ Params: { imageKey: string } }>("/media/products/:imageKey", async (request, reply) => {
+    // Public, cached images must not consume the per-IP API budget.
+    app.get<{ Params: { imageKey: string } }>("/media/products/:imageKey", { config: { rateLimit: false } }, async (request, reply) => {
       const image = await readProductImage(env.UPLOAD_DIR, request.params.imageKey);
       return reply
         .header("Content-Type", image.mimeType)

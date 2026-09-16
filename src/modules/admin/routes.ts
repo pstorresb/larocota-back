@@ -1,11 +1,11 @@
-import type { FastifyPluginAsync, FastifyRequest } from "fastify";
+import type { FastifyPluginAsync } from "fastify";
 import { hash as hashPassword } from "@node-rs/argon2";
 import { z } from "zod";
 import type { AppEnv } from "../../config/env.js";
 import type { Database } from "../../db/client.js";
 import { deleteUploadedProductImage, storeProductImage } from "../../common/storage/product-images.js";
 import { loadModifierGroups } from "../catalog/configuration.js";
-import { getSessionUser } from "../auth/session.js";
+import { requireAdmin, requireSuperadmin } from "../auth/guards.js";
 import { assertTransition, orderStatuses, type OrderStatus } from "../orders/state-machine.js";
 import { sendOrderStatusEmail } from "../../common/email/resend.js";
 
@@ -46,19 +46,6 @@ const updateUserSchema = z.object({
   role: userRoleSchema.optional(),
   status: userStatusSchema.optional(),
 }).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
-
-async function requireAdmin(sql: Database, env: AppEnv, request: FastifyRequest) {
-  const user = await getSessionUser(sql, env, request);
-  if (!user) throw Object.assign(new Error("Inicia sesión para continuar."), { statusCode: 401 });
-  if (!['admin', 'superadmin'].includes(user.role)) throw Object.assign(new Error("No tienes permiso para esta acción."), { statusCode: 403 });
-  return user;
-}
-
-async function requireSuperadmin(sql: Database, env: AppEnv, request: FastifyRequest) {
-  const user = await requireAdmin(sql, env, request);
-  if (user.role !== "superadmin") throw Object.assign(new Error("Solo un superadministrador puede gestionar usuarios."), { statusCode: 403 });
-  return user;
-}
 
 export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
   return async (app) => {
@@ -161,6 +148,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         select o.id, o.order_number, o.status, o.fulfillment_type, o.contact_snapshot, o.address_snapshot,
           o.customer_notes, o.admin_public_note, o.admin_private_note, o.currency, o.subtotal, o.tax_total,
           o.total, o.created_at, o.submitted_at, o.confirmed_at, sc.fulfillment_at,
+          (select min(sr.expires_at) from stock_reservations sr where sr.order_id = o.id and sr.status = 'reserved') as payment_deadline,
           u.first_name, u.last_name, u.email
         from orders o
         join users u on u.id = o.user_id
@@ -260,7 +248,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note, private_note) values (${order.id}, ${order.status}, ${parsed.data.status}, ${user.id}, ${parsed.data.publicNote ?? null}, ${parsed.data.privateNote ?? null})`;
         await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'order', ${order.id}, 'status_changed', ${tx.json({ status: order.status })}, ${tx.json({ status: parsed.data.status })})`;
         if (parsed.data.status === "cancelled") await tx`update stock_reservations set status = 'released' where order_id = ${order.id} and status in ('reserved', 'committed')`;
-        return { result, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: parsed.data.status, fulfillmentType: order.fulfillmentType } };
+        return { result, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: parsed.data.status, fulfillmentType: order.fulfillmentType, note: parsed.data.publicNote ?? null } };
       });
       try { await sendOrderStatusEmail(env, updated.notification); } catch (error) { request.log.error({ err: error, orderId: updated.result.id }, "Could not send order status email"); }
       return { order: updated.result };
@@ -270,6 +258,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       const user = await requireAdmin(sql, env, request);
       const parsed = z.discriminatedUnion("decision", [z.object({ decision: z.literal("approve") }), z.object({ decision: z.literal("reject"), reason: z.string().trim().min(5).max(500) })]).safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Indica una decisión y el motivo cuando corresponda." });
+      if (!z.string().uuid().safeParse(request.params.proofId).success) return reply.code(404).send({ code: "NOT_FOUND", message: "Comprobante no encontrado." });
       const result = await sql.begin(async (tx) => {
         const [proof] = await tx<{ id: string; orderId: string; status: string }[]>`select id, order_id, status from payment_proofs where id = ${request.params.proofId} for update`;
         if (!proof) throw Object.assign(new Error("Comprobante no encontrado."), { statusCode: 404 });
@@ -284,11 +273,11 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note) values (${order.id}, ${order.status}, ${nextStatus}, ${user.id}, ${approved ? 'Pago confirmado.' : reason})`;
         await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'payment_proof', ${proof.id}, ${approved ? 'approved' : 'rejected'}, ${tx.json({ reason })})`;
         if (approved) await tx`update stock_reservations set status = 'committed' where order_id = ${order.id} and status = 'reserved'`;
-        return { proofId: proof.id, orderId: order.id, orderStatus: nextStatus, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: nextStatus, fulfillmentType: order.fulfillmentType } };
+        // A rejected proof reopens the payment window so the customer can upload a new one; expiry cancels it otherwise.
+        else await tx`update stock_reservations set expires_at = now() + (${env.PAYMENT_WINDOW_HOURS}::numeric * interval '1 hour') where order_id = ${order.id} and status = 'reserved'`;
+        return { proofId: proof.id, orderId: order.id, orderStatus: nextStatus, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: nextStatus, fulfillmentType: order.fulfillmentType, note: reason } };
       });
-      if (result.orderStatus === "confirmed") {
-        try { await sendOrderStatusEmail(env, result.notification); } catch (error) { request.log.error({ err: error, orderId: result.orderId }, "Could not send payment approval email"); }
-      }
+      try { await sendOrderStatusEmail(env, result.notification); } catch (error) { request.log.error({ err: error, orderId: result.orderId }, "Could not send payment review email"); }
       return { result: { proofId: result.proofId, orderId: result.orderId, orderStatus: result.orderStatus } };
     });
 

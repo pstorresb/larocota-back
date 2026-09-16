@@ -18,13 +18,26 @@ const quoteSchema = z.object({
   })).min(1).max(30),
 });
 
+const addressSchema = z.object({
+  addressLine: z.string().trim().min(8).max(300),
+  requestedDeliveryTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
+  sector: z.string().trim().max(120).default(""),
+  reference: z.string().trim().max(500).default(""),
+  locationText: z.string().trim().max(500).optional(),
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional(),
+});
+
 const checkoutSchema = z.object({
   cycleId: z.string().uuid(),
   fulfillmentType: z.enum(["pickup", "delivery"]),
   contact: z.object({ email: z.string().email(), firstName: z.string().min(2).max(80), lastName: z.string().min(2).max(80), phone: z.string().trim().regex(/^0\d{9}$/, "El teléfono debe tener 10 dígitos en formato 0XXXXXXXXX.") }),
-  address: z.object({ addressLine: z.string().trim().min(8).max(300), requestedDeliveryTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), sector: z.string().trim().max(120), reference: z.string().trim().max(500), locationText: z.string().trim().max(500).optional(), latitude: z.number().min(-90).max(90).optional(), longitude: z.number().min(-180).max(180).optional() }),
+  // Required for delivery, ignored for pickup.
+  address: addressSchema.nullish(),
   customerNotes: z.string().max(500).optional(),
   items: z.array(z.object({ productId: z.string().uuid(), quantity: z.number().int().min(1).max(20), selections: selectionsSchema, customerNote: z.string().max(240).optional() })).min(1).max(30),
+}).superRefine((value, context) => {
+  if (value.fulfillmentType === "delivery" && !value.address) context.addIssue({ code: "custom", path: ["address"], message: "Indica la dirección de entrega." });
 });
 
 export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { return async (app) => {
@@ -34,6 +47,7 @@ export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { re
     const orders = await sql`
       select o.id, o.order_number, o.status, o.fulfillment_type, o.currency, o.subtotal, o.tax_total, o.total,
         o.created_at, o.submitted_at, sc.fulfillment_at,
+        (select min(sr.expires_at) from stock_reservations sr where sr.order_id = o.id and sr.status = 'reserved') as payment_deadline,
         coalesce(json_agg(json_build_object('name', oi.product_name_snapshot, 'quantity', oi.quantity, 'lineTotal', oi.line_total) order by oi.id) filter (where oi.id is not null), '[]'::json) as items
       from orders o
       join sales_cycles sc on sc.id = o.sales_cycle_id
@@ -44,6 +58,29 @@ export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { re
       limit 100
     `;
     return { orders };
+  });
+
+  // Customer-facing order detail (owner only). Powers the confirmation page and order tracking.
+  app.get<{ Params: { orderNumber: string } }>("/orders/:orderNumber", async (request, reply) => {
+    const user = await getSessionUser(sql, env, request);
+    if (!user) return reply.code(401).send({ code: "AUTH_REQUIRED", message: "Inicia sesión para ver tu pedido." });
+    const [order] = await sql`
+      select o.id, o.order_number, o.status, o.fulfillment_type, o.contact_snapshot, o.address_snapshot, o.customer_notes,
+        o.admin_public_note, o.currency, o.subtotal, o.tax_total, o.total, o.created_at, o.submitted_at, o.confirmed_at,
+        o.cancelled_at, o.delivered_at,
+        sc.name as cycle_name, sc.fulfillment_at,
+        (select min(sr.expires_at) from stock_reservations sr where sr.order_id = o.id and sr.status = 'reserved') as payment_deadline
+      from orders o
+      join sales_cycles sc on sc.id = o.sales_cycle_id
+      where o.order_number = ${request.params.orderNumber.toUpperCase()} and o.user_id = ${user.id}
+    `;
+    if (!order) return reply.code(404).send({ code: "ORDER_NOT_FOUND", message: "Pedido no encontrado." });
+    const [items, proofs, history] = await Promise.all([
+      sql`select id, product_name_snapshot as name, quantity, unit_total, line_total, tax_total, customer_note, snapshot_json from order_items where order_id = ${order.id} order by id`,
+      sql`select id, status, original_name, rejection_reason, created_at, reviewed_at from payment_proofs where order_id = ${order.id} and status <> 'superseded' order by created_at desc limit 1`,
+      sql`select id, from_status, to_status, public_note, created_at from order_status_history where order_id = ${order.id} order by created_at asc`,
+    ]);
+    return { order: { ...order, items, proof: proofs[0] ?? null, history } };
   });
 
   app.post("/orders/quote", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
@@ -65,12 +102,13 @@ export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { re
     });
     return { currency: "USD", ...calculateOrder(lines), items: lines.map((line) => ({ productId: line.productId, modifierCents: line.modifierCents, unitCents: line.unitBaseCents + line.modifierCents })), expiresInSeconds: 300 };
   });
+
   app.post("/orders", { config: { rateLimit: { max: 10, timeWindow: "5 minutes" } } }, async (request, reply) => {
     const user = await getSessionUser(sql, env, request);
     if (!user) return reply.code(401).send({ code: "AUTH_REQUIRED", message: "Inicia sesión para finalizar el pedido." });
     const parsed = checkoutSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa los datos del pedido.", details: parsed.error.flatten() });
-    const order = await submitOrder(sql, { ...parsed.data, userId: user.id });
+    if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: parsed.error.issues[0]?.message ?? "Revisa los datos del pedido.", details: parsed.error.flatten() });
+    const order = await submitOrder(sql, { ...parsed.data, userId: user.id, paymentWindowHours: env.PAYMENT_WINDOW_HOURS });
     return reply.code(201).send({ order });
   });
 }; }

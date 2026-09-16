@@ -31,18 +31,25 @@ const orderCopy: Record<string, { title: string; body: string }> = {
   ready: { title: "Tu pedido está listo", body: "Tu pedido está listo para su siguiente paso." },
   out_for_delivery: { title: "Tu pedido va en camino", body: "Tu pedido salió y va rumbo a tu dirección." },
   delivered: { title: "Pedido entregado", body: "Confirmamos que tu pedido fue entregado. ¡Buen provecho!" },
+  payment_rejected: { title: "No pudimos validar tu comprobante", body: "Revisamos el comprobante que enviaste y no pudimos validarlo. Puedes subir uno nuevo desde tu cuenta para conservar tu pedido." },
+  cancelled: { title: "Tu pedido fue cancelado", body: "Tu pedido quedó cancelado y liberamos los cupos reservados. Si crees que es un error, escríbenos." },
 };
 
-export async function sendOrderStatusEmail(env: AppEnv, input: { email: string; firstName: string; orderNumber: string; status: string; fulfillmentType: string }) {
+export type OrderStatusEmail = { email: string; firstName: string; orderNumber: string; status: string; fulfillmentType: string; note?: string | null };
+
+/** Sends the customer-facing email for a status change. Statuses without copy (draft, payment_pending, payment_review) send nothing. */
+export async function sendOrderStatusEmail(env: AppEnv, input: OrderStatusEmail) {
   const copy = orderCopy[input.status];
   if (!copy) return;
   const name = escapeHtml(input.firstName || "hola");
   const orderNumber = escapeHtml(input.orderNumber);
   const detail = input.status === "ready" && input.fulfillmentType === "pickup" ? "Ya puedes acercarte a retirarlo." : copy.body;
+  const note = input.note?.trim() ? input.note.trim() : null;
+  const noteLabel = input.status === "payment_rejected" ? "Motivo" : "Nota";
   await sendEmail(env, {
     to: input.email,
     subject: `${copy.title} · ${input.orderNumber}`,
-    text: `Hola ${input.firstName || ""}, ${detail} Pedido ${input.orderNumber}.`,
-    html: `<div style="font-family:Arial,sans-serif;color:#211f1c"><p>Hola ${name},</p><h2>${copy.title}</h2><p>${escapeHtml(detail)}</p><p><strong>Pedido ${orderNumber}</strong></p></div>`,
+    text: `Hola ${input.firstName || ""}, ${detail}${note ? ` ${noteLabel}: ${note}.` : ""} Pedido ${input.orderNumber}.`,
+    html: `<div style="font-family:Arial,sans-serif;color:#211f1c"><p>Hola ${name},</p><h2>${copy.title}</h2><p>${escapeHtml(detail)}</p>${note ? `<p style="border-left:3px solid #e92b25;padding:8px 12px;background:#faf8f5"><strong>${noteLabel}:</strong> ${escapeHtml(note)}</p>` : ""}<p><strong>Pedido ${orderNumber}</strong></p></div>`,
   });
 }

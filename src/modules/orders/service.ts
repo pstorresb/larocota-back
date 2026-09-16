@@ -3,14 +3,18 @@ import type { Database } from "../../db/client.js";
 import { loadModifierGroups, resolveModifierSelection, type ModifierSelectionInput } from "../catalog/configuration.js";
 
 export type CheckoutItem = { productId: string; quantity: number; selections: ModifierSelectionInput[]; customerNote?: string };
+export type CheckoutAddress = { addressLine: string; requestedDeliveryTime?: string; sector: string; reference: string; locationText?: string; latitude?: number; longitude?: number };
 export type CheckoutInput = {
   userId: string;
   cycleId: string;
   fulfillmentType: "pickup" | "delivery";
   contact: { email: string; firstName: string; lastName: string; phone: string };
-  address: { addressLine: string; requestedDeliveryTime: string; sector: string; reference: string; locationText?: string; latitude?: number; longitude?: number };
+  /** Required for delivery; ignored (stored as null) for pickup. */
+  address?: CheckoutAddress | null;
   customerNotes?: string;
   items: CheckoutItem[];
+  /** Hours the customer has to upload a payment proof before the reservation expires. */
+  paymentWindowHours: number;
 };
 
 function amount(cents: number) { return (cents / 100).toFixed(2); }
@@ -24,8 +28,14 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
     const now = new Date();
     if (!cycle || cycle.status !== "open" || cycle.opensAt > now || cycle.closesAt <= now) throw Object.assign(new Error("El ciclo de venta no está abierto."), { statusCode: 409 });
     if (!cycle.fulfillmentModes.includes(input.fulfillmentType)) throw Object.assign(new Error("La modalidad de entrega no está disponible para este ciclo."), { statusCode: 409 });
+    if (input.fulfillmentType === "delivery" && !input.address) throw Object.assign(new Error("Indica la dirección de entrega."), { statusCode: 400 });
+    const address = input.fulfillmentType === "delivery" ? input.address ?? null : null;
+
+    // Live reservations: committed ones, plus reserved ones whose payment window has not expired.
     const [{ count: cycleReserved = 0 } = { count: 0 }] = await tx<{ count: number }[]>`
-      select coalesce(sum(quantity), 0)::int as count from stock_reservations where cycle_id = ${input.cycleId} and status in ('reserved', 'committed')
+      select coalesce(sum(quantity), 0)::int as count from stock_reservations
+      where cycle_id = ${input.cycleId}
+        and (status = 'committed' or (status = 'reserved' and (expires_at is null or expires_at > now())))
     `;
     const requestedUnits = input.items.reduce((sum, item) => sum + item.quantity, 0);
     if (cycle.globalCapacity !== null && cycleReserved + requestedUnits > cycle.globalCapacity) throw Object.assign(new Error("Ya no hay cupos suficientes para este ciclo."), { statusCode: 409 });
@@ -41,7 +51,8 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
       if (!product || !product.isAvailable) throw Object.assign(new Error("Uno de los productos ya no está disponible."), { statusCode: 409 });
       const [{ reserved = 0 } = { reserved: 0 }] = await tx<{ reserved: number }[]>`
         select coalesce(sum(quantity), 0)::int as reserved from stock_reservations
-        where cycle_id = ${input.cycleId} and product_id = ${item.productId} and status in ('reserved', 'committed')
+        where cycle_id = ${input.cycleId} and product_id = ${item.productId}
+          and (status = 'committed' or (status = 'reserved' and (expires_at is null or expires_at > now())))
       `;
       if (product.capacity !== null && reserved + item.quantity > product.capacity) throw Object.assign(new Error(`${product.name} ya no tiene cupos suficientes.`), { statusCode: 409 });
       const unitBaseCents = Math.round(Number(product.priceOverride ?? product.basePrice) * 100);
@@ -61,7 +72,7 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
       try {
         [created] = await tx<{ id: string; orderNumber: string; status: string }[]>`
           insert into orders (order_number, user_id, sales_cycle_id, status, fulfillment_type, contact_snapshot, address_snapshot, customer_notes, subtotal, tax_total, total, submitted_at)
-          values (${orderNumber()}, ${input.userId}, ${input.cycleId}, 'payment_pending', ${input.fulfillmentType}, ${tx.json(input.contact)}, ${tx.json(input.address)}, ${input.customerNotes ?? null}, ${amount(subtotalCents)}, ${amount(taxCents)}, ${amount(totalCents)}, now())
+          values (${orderNumber()}, ${input.userId}, ${input.cycleId}, 'payment_pending', ${input.fulfillmentType}, ${tx.json(input.contact)}, ${address ? tx.json(address) : null}, ${input.customerNotes ?? null}, ${amount(subtotalCents)}, ${amount(taxCents)}, ${amount(totalCents)}, now())
           returning id, order_number, status
         `;
       } catch (error) {
@@ -69,14 +80,15 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
       }
     }
     if (!created) throw new Error("Order creation failed");
+    const paymentDeadline = new Date(now.getTime() + input.paymentWindowHours * 3_600_000);
     for (const item of prepared) {
       await tx`
         insert into order_items (order_id, product_id, product_name_snapshot, unit_base_price, quantity, modifier_total, unit_total, line_total, tax_total, customer_note, snapshot_json)
         values (${created.id}, ${item.productId}, ${item.name}, ${amount(item.unitBaseCents)}, ${item.quantity}, ${amount(item.modifierCents)}, ${amount(item.unitTotalCents)}, ${amount(item.totalCents)}, ${amount(item.taxCents)}, ${item.note ?? null}, ${tx.json({ productId: item.productId, name: item.name, taxRateBps: item.taxRateBps, modifiers: item.modifierSnapshot })})
       `;
-      await tx`insert into stock_reservations (cycle_id, product_id, order_id, quantity, status) values (${input.cycleId}, ${item.productId}, ${created.id}, ${item.quantity}, 'reserved')`;
+      await tx`insert into stock_reservations (cycle_id, product_id, order_id, quantity, status, expires_at) values (${input.cycleId}, ${item.productId}, ${created.id}, ${item.quantity}, 'reserved', ${paymentDeadline})`;
     }
     await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note) values (${created.id}, 'draft', 'payment_pending', ${input.userId}, 'Pedido recibido; comprobante pendiente.')`;
-    return { ...created, currency: "USD", subtotalCents, taxCents, totalCents };
+    return { ...created, currency: "USD", subtotalCents, taxCents, totalCents, paymentDeadline: paymentDeadline.toISOString() };
   });
 }

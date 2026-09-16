@@ -11,7 +11,8 @@
     "test": "vitest run",
     "migrate": "tsx scripts/migrate.ts",
     "seed": "tsx scripts/seed.ts",
-    "seed:demo": "tsx scripts/seed-demo.ts"
+    "seed:demo": "tsx scripts/seed-demo.ts",
+    "maintenance": "tsx scripts/maintenance.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
