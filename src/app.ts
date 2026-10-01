@@ -27,6 +27,21 @@ export async function buildApp(env: AppEnv) {
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   await app.register(multipart, { limits: { fileSize: env.MAX_UPLOAD_BYTES, files: 1, fields: 5 } });
 
+  // Must be set before registering plugins: each plugin snapshots the parent's error handler when it is created.
+  app.setErrorHandler((error, request, reply) => {
+    const appError = error as Error & { statusCode?: number; code?: unknown };
+    const statusCode = appError.statusCode && appError.statusCode < 500 ? appError.statusCode : 500;
+    if (statusCode >= 500) request.log.error({ err: error }, "request failed");
+    else request.log.warn({ err: error }, "request rejected");
+    // Domain errors may carry a stable SCREAMING_SNAKE code (e.g. SLOT_FULL); Postgres and Node codes never match this shape.
+    const domainCode = typeof appError.code === "string" && /^[A-Z][A-Z_]+$/.test(appError.code) ? appError.code : null;
+    return reply.code(statusCode).send({
+      code: statusCode === 500 ? "INTERNAL_ERROR" : domainCode ?? "REQUEST_ERROR",
+      message: statusCode === 500 ? "No pudimos procesar la solicitud." : appError.message,
+      requestId: request.id,
+    });
+  });
+
   app.get("/health", async () => ({ status: "ok", service: "larocota-api" }));
   app.get("/ready", async (_request, reply) => {
     try { await sql`select 1`; return { status: "ready" }; }
@@ -39,13 +54,6 @@ export async function buildApp(env: AppEnv) {
   await app.register(settingsRoutes(sql, env), { prefix: "/api/v1" });
   await app.register(adminRoutes(sql, env), { prefix: "/api/v1" });
 
-  app.setErrorHandler((error, request, reply) => {
-    const appError = error as Error & { statusCode?: number };
-    const statusCode = appError.statusCode && appError.statusCode < 500 ? appError.statusCode : 500;
-    if (statusCode >= 500) request.log.error({ err: error }, "request failed");
-    else request.log.warn({ err: error }, "request rejected");
-    return reply.code(statusCode).send({ code: statusCode === 500 ? "INTERNAL_ERROR" : "REQUEST_ERROR", message: statusCode === 500 ? "No pudimos procesar la solicitud." : appError.message, requestId: request.id });
-  });
   app.addHook("onClose", async () => { await sql.end(); });
   app.decorate("sql", sql);
   return app;

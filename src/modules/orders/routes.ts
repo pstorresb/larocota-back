@@ -1,44 +1,11 @@
 import type { FastifyPluginAsync } from "fastify";
-import { z } from "zod";
 import { calculateOrder } from "../../common/money.js";
 import type { AppEnv } from "../../config/env.js";
 import type { Database } from "../../db/client.js";
 import { getSessionUser } from "../auth/session.js";
 import { submitOrder } from "./service.js";
+import { checkoutSchema, quoteSchema } from "./schemas.js";
 import { loadModifierGroups, resolveModifierSelection } from "../catalog/configuration.js";
-
-const selectionsSchema = z.array(z.object({ groupId: z.string().uuid(), options: z.array(z.object({ optionId: z.string().uuid(), quantity: z.number().int().min(1).max(20) })).max(100) })).max(30).default([]);
-
-const quoteSchema = z.object({
-  cycleId: z.string().uuid(),
-  items: z.array(z.object({
-    productId: z.string().min(1),
-    quantity: z.number().int().min(1).max(20),
-    selections: selectionsSchema,
-  })).min(1).max(30),
-});
-
-const addressSchema = z.object({
-  addressLine: z.string().trim().min(8).max(300),
-  requestedDeliveryTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
-  sector: z.string().trim().max(120).default(""),
-  reference: z.string().trim().max(500).default(""),
-  locationText: z.string().trim().max(500).optional(),
-  latitude: z.number().min(-90).max(90).optional(),
-  longitude: z.number().min(-180).max(180).optional(),
-});
-
-const checkoutSchema = z.object({
-  cycleId: z.string().uuid(),
-  fulfillmentType: z.enum(["pickup", "delivery"]),
-  contact: z.object({ email: z.string().email(), firstName: z.string().min(2).max(80), lastName: z.string().min(2).max(80), phone: z.string().trim().regex(/^0\d{9}$/, "El teléfono debe tener 10 dígitos en formato 0XXXXXXXXX.") }),
-  // Required for delivery, ignored for pickup.
-  address: addressSchema.nullish(),
-  customerNotes: z.string().max(500).optional(),
-  items: z.array(z.object({ productId: z.string().uuid(), quantity: z.number().int().min(1).max(20), selections: selectionsSchema, customerNote: z.string().max(240).optional() })).min(1).max(30),
-}).superRefine((value, context) => {
-  if (value.fulfillmentType === "delivery" && !value.address) context.addIssue({ code: "custom", path: ["address"], message: "Indica la dirección de entrega." });
-});
 
 export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { return async (app) => {
   app.get("/orders/mine", async (request, reply) => {
@@ -46,14 +13,15 @@ export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { re
     if (!user) return reply.code(401).send({ code: "AUTH_REQUIRED", message: "Inicia sesión para consultar tus pedidos." });
     const orders = await sql`
       select o.id, o.order_number, o.status, o.fulfillment_type, o.currency, o.subtotal, o.tax_total, o.total,
-        o.created_at, o.submitted_at, sc.fulfillment_at,
+        o.created_at, o.submitted_at, o.slot_starts_at, o.slot_ends_at,
+        sc.fulfillment_starts_at, sc.fulfillment_ends_at,
         (select min(sr.expires_at) from stock_reservations sr where sr.order_id = o.id and sr.status = 'reserved') as payment_deadline,
         coalesce(json_agg(json_build_object('name', oi.product_name_snapshot, 'quantity', oi.quantity, 'lineTotal', oi.line_total) order by oi.id) filter (where oi.id is not null), '[]'::json) as items
       from orders o
       join sales_cycles sc on sc.id = o.sales_cycle_id
       left join order_items oi on oi.order_id = o.id
       where o.user_id = ${user.id}
-      group by o.id, sc.fulfillment_at
+      group by o.id, sc.fulfillment_starts_at, sc.fulfillment_ends_at
       order by o.created_at desc
       limit 100
     `;
@@ -67,8 +35,8 @@ export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { re
     const [order] = await sql`
       select o.id, o.order_number, o.status, o.fulfillment_type, o.contact_snapshot, o.address_snapshot, o.customer_notes,
         o.admin_public_note, o.currency, o.subtotal, o.tax_total, o.total, o.created_at, o.submitted_at, o.confirmed_at,
-        o.cancelled_at, o.delivered_at,
-        sc.name as cycle_name, sc.fulfillment_at,
+        o.cancelled_at, o.delivered_at, o.slot_starts_at, o.slot_ends_at,
+        sc.name as cycle_name, sc.fulfillment_starts_at, sc.fulfillment_ends_at,
         (select min(sr.expires_at) from stock_reservations sr where sr.order_id = o.id and sr.status = 'reserved') as payment_deadline
       from orders o
       join sales_cycles sc on sc.id = o.sales_cycle_id

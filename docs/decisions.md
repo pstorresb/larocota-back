@@ -6,6 +6,7 @@
 - Dominio canónico: `https://larocota.com`; `www` redirige al dominio principal.
 - Zona horaria de presentación: `America/Guayaquil`; persistencia temporal en UTC.
 - Modalidad inicial: retiro en Ibarra; cada ciclo define sus fechas y capacidad desde administración.
+- Franjas de entrega: cada ciclo define una ventana de entrega (`fulfillment_starts_at`–`fulfillment_ends_at`, máximo 24 h) dividida en franjas de 30 o 60 minutos con cupo opcional de pedidos por franja. Las franjas se calculan, no se guardan; el pedido registra la franja elegida (`orders.slot_starts_at`). El cliente elige franja tanto para retiro como para entrega; la hora ya no vive dentro de la dirección. Un pedido pendiente de pago ocupa su asiento hasta que el mantenimiento lo cancela.
 - IVA: configurable por producto; el backend persiste la tasa y conserva snapshots en cada orden.
 - Pago: transferencia bancaria con comprobante JPG, PNG, WebP o PDF de hasta 8 MB. El checkout no publica identificación del titular; mostrará el número completo de cuenta únicamente cuando exista una cuenta real configurada.
 - Autenticación: sesión aleatoria guardada como hash; cookie `HttpOnly`, `SameSite=Lax` y `Secure` en producción.
@@ -14,7 +15,7 @@
 
 ## Pendientes antes de producción
 
-- Dirección exacta y horarios definitivos de retiro; zonas y tarifas si se habilita delivery.
+- Dirección exacta del punto de retiro; zonas y tarifas si se habilita delivery (los horarios ya los define cada ciclo con sus franjas).
 - Datos reales de Banco Pichincha y responsables autorizados para editarlos.
 - Confirmación contable de precios con IVA y tasas por producto.
 - Política de cancelación, reembolso, comprobantes rechazados y caducidad de reservas.

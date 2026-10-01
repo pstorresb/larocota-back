@@ -1,13 +1,16 @@
 import { randomInt } from "node:crypto";
 import type { Database } from "../../db/client.js";
 import { loadModifierGroups, resolveModifierSelection, type ModifierSelectionInput } from "../catalog/configuration.js";
+import { findSlot } from "../cycles/slots.js";
 
 export type CheckoutItem = { productId: string; quantity: number; selections: ModifierSelectionInput[]; customerNote?: string };
-export type CheckoutAddress = { addressLine: string; requestedDeliveryTime?: string; sector: string; reference: string; locationText?: string; latitude?: number; longitude?: number };
+export type CheckoutAddress = { addressLine: string; sector: string; reference: string; locationText?: string; latitude?: number; longitude?: number };
 export type CheckoutInput = {
   userId: string;
   cycleId: string;
   fulfillmentType: "pickup" | "delivery";
+  /** Start of the chosen fulfillment slot (ISO 8601). Must match one of the cycle's computed slots. */
+  slotStartsAt: string;
   contact: { email: string; firstName: string; lastName: string; phone: string };
   /** Required for delivery; ignored (stored as null) for pickup. */
   address?: CheckoutAddress | null;
@@ -22,14 +25,31 @@ function orderNumber() { return `ROC-${new Date().getUTCFullYear()}-${randomInt(
 
 export async function submitOrder(sql: Database, input: CheckoutInput) {
   return sql.begin(async (tx) => {
-    const [cycle] = await tx<{ id: string; status: string; opensAt: Date; closesAt: Date; globalCapacity: number | null; fulfillmentModes: ("pickup" | "delivery")[] }[]>`
-      select id, status, opens_at, closes_at, global_capacity, fulfillment_modes from sales_cycles where id = ${input.cycleId} for update
+    const [cycle] = await tx<{
+      id: string; status: string; opensAt: Date; closesAt: Date; globalCapacity: number | null; fulfillmentModes: ("pickup" | "delivery")[];
+      fulfillmentStartsAt: Date; fulfillmentEndsAt: Date; slotMinutes: number; slotCapacity: number | null;
+    }[]>`
+      select id, status, opens_at, closes_at, global_capacity, fulfillment_modes,
+        fulfillment_starts_at, fulfillment_ends_at, slot_minutes, slot_capacity
+      from sales_cycles where id = ${input.cycleId} for update
     `;
     const now = new Date();
     if (!cycle || cycle.status !== "open" || cycle.opensAt > now || cycle.closesAt <= now) throw Object.assign(new Error("El ciclo de venta no está abierto."), { statusCode: 409 });
     if (!cycle.fulfillmentModes.includes(input.fulfillmentType)) throw Object.assign(new Error("La modalidad de entrega no está disponible para este ciclo."), { statusCode: 409 });
     if (input.fulfillmentType === "delivery" && !input.address) throw Object.assign(new Error("Indica la dirección de entrega."), { statusCode: 400 });
     const address = input.fulfillmentType === "delivery" ? input.address ?? null : null;
+
+    // The slot must be one of the cycle's computed slots. Seats are counted per order (one arrival or
+    // courier stop each); the cycle row lock above serializes this check with concurrent checkouts.
+    const slot = findSlot(cycle, input.slotStartsAt);
+    if (!slot) throw Object.assign(new Error("La franja elegida no pertenece a este ciclo."), { statusCode: 400, code: "INVALID_SLOT" });
+    if (cycle.slotCapacity !== null) {
+      const [{ taken = 0 } = { taken: 0 }] = await tx<{ taken: number }[]>`
+        select count(*)::int as taken from orders
+        where sales_cycle_id = ${input.cycleId} and slot_starts_at = ${slot.startsAt} and status <> 'cancelled'
+      `;
+      if (taken >= cycle.slotCapacity) throw Object.assign(new Error("Esa franja ya está llena. Elige otra."), { statusCode: 409, code: "SLOT_FULL" });
+    }
 
     // Live reservations: committed ones, plus reserved ones whose payment window has not expired.
     const [{ count: cycleReserved = 0 } = { count: 0 }] = await tx<{ count: number }[]>`
@@ -71,8 +91,8 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
     for (let attempt = 0; attempt < 3 && !created; attempt += 1) {
       try {
         [created] = await tx<{ id: string; orderNumber: string; status: string }[]>`
-          insert into orders (order_number, user_id, sales_cycle_id, status, fulfillment_type, contact_snapshot, address_snapshot, customer_notes, subtotal, tax_total, total, submitted_at)
-          values (${orderNumber()}, ${input.userId}, ${input.cycleId}, 'payment_pending', ${input.fulfillmentType}, ${tx.json(input.contact)}, ${address ? tx.json(address) : null}, ${input.customerNotes ?? null}, ${amount(subtotalCents)}, ${amount(taxCents)}, ${amount(totalCents)}, now())
+          insert into orders (order_number, user_id, sales_cycle_id, status, fulfillment_type, slot_starts_at, slot_ends_at, contact_snapshot, address_snapshot, customer_notes, subtotal, tax_total, total, submitted_at)
+          values (${orderNumber()}, ${input.userId}, ${input.cycleId}, 'payment_pending', ${input.fulfillmentType}, ${slot.startsAt}, ${slot.endsAt}, ${tx.json(input.contact)}, ${address ? tx.json(address) : null}, ${input.customerNotes ?? null}, ${amount(subtotalCents)}, ${amount(taxCents)}, ${amount(totalCents)}, now())
           returning id, order_number, status
         `;
       } catch (error) {
@@ -89,6 +109,15 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
       await tx`insert into stock_reservations (cycle_id, product_id, order_id, quantity, status, expires_at) values (${input.cycleId}, ${item.productId}, ${created.id}, ${item.quantity}, 'reserved', ${paymentDeadline})`;
     }
     await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note) values (${created.id}, 'draft', 'payment_pending', ${input.userId}, 'Pedido recibido; comprobante pendiente.')`;
-    return { ...created, currency: "USD", subtotalCents, taxCents, totalCents, paymentDeadline: paymentDeadline.toISOString() };
+    return {
+      ...created,
+      currency: "USD",
+      subtotalCents,
+      taxCents,
+      totalCents,
+      paymentDeadline: paymentDeadline.toISOString(),
+      slotStartsAt: slot.startsAt.toISOString(),
+      slotEndsAt: slot.endsAt.toISOString(),
+    };
   });
 }

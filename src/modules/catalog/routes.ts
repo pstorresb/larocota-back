@@ -3,13 +3,49 @@ import type { AppEnv } from "../../config/env.js";
 import type { Database } from "../../db/client.js";
 import { readProductImage } from "../../common/storage/product-images.js";
 import { loadModifierGroups } from "./configuration.js";
+import { buildSlots } from "../cycles/slots.js";
+
+type CatalogCycleRow = {
+  id: string; name: string; status: string; opensAt: Date; closesAt: Date;
+  fulfillmentStartsAt: Date; fulfillmentEndsAt: Date; slotMinutes: number; slotCapacity: number | null;
+  globalCapacity: number | null; publicMessage: string | null; fulfillmentModes: string[]; isOpen: boolean;
+};
 
 export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
   return async (app) => {
+    /** Adds remaining global capacity and the computed slot grid with per-slot remaining seats. */
+    async function decorateCycle(cycle: CatalogCycleRow) {
+      const [reservedRow] = await sql<{ reserved: number }[]>`
+        select coalesce(sum(quantity), 0)::int as reserved from stock_reservations
+        where cycle_id = ${cycle.id}
+          and (status = 'committed' or (status = 'reserved' and (expires_at is null or expires_at > now())))
+      `;
+      // A slot seat is an order (one arrival / one courier stop), not a unit. Pending orders hold their seat
+      // during the payment window; the maintenance job cancels them when it expires.
+      const occupancy = await sql<{ slotStartsAt: Date; orders: number }[]>`
+        select slot_starts_at, count(*)::int as orders from orders
+        where sales_cycle_id = ${cycle.id} and status <> 'cancelled' and slot_starts_at is not null
+        group by slot_starts_at
+      `;
+      const taken = new Map(occupancy.map((row) => [new Date(row.slotStartsAt).getTime(), row.orders]));
+      const slots = buildSlots(cycle).map((slot) => ({
+        startsAt: slot.startsAt.toISOString(),
+        endsAt: slot.endsAt.toISOString(),
+        remaining: cycle.slotCapacity === null ? null : Math.max(0, cycle.slotCapacity - (taken.get(slot.startsAt.getTime()) ?? 0)),
+      }));
+      const reserved = reservedRow?.reserved ?? 0;
+      return {
+        ...cycle,
+        globalRemaining: cycle.globalCapacity === null ? null : Math.max(0, cycle.globalCapacity - reserved),
+        slots,
+      };
+    }
+
     async function activeCatalog() {
       // An open cycle inside its window wins; otherwise the next scheduled one is shown as "coming soon" (isOpen = false).
-      const [cycle] = await sql`
-        select id, name, status, opens_at, closes_at, fulfillment_at, public_message, fulfillment_modes,
+      const [cycleRow] = await sql<CatalogCycleRow[]>`
+        select id, name, status, opens_at, closes_at, fulfillment_starts_at, fulfillment_ends_at,
+          slot_minutes, slot_capacity, global_capacity, public_message, fulfillment_modes,
           (status = 'open' and opens_at <= now() and closes_at > now()) as is_open
         from sales_cycles
         where (status = 'open' and opens_at <= now() and closes_at > now())
@@ -17,7 +53,8 @@ export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         order by case when status = 'open' then 0 else 1 end, opens_at
         limit 1
       `;
-      if (!cycle) return { cycle: null, categories: [], products: [] };
+      if (!cycleRow) return { cycle: null, categories: [], products: [] };
+      const cycle = await decorateCycle(cycleRow);
       const products = await sql`
         select p.id, p.name, p.slug, p.short_description as description, p.base_price, p.tax_rate,
           p.image_key, p.image_alt, p.badge, p.updated_at,

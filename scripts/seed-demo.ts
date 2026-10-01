@@ -195,13 +195,17 @@ try {
 
   const opensAt = new Date(Date.now() - 60 * 60 * 1000);
   const closesAt = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
-  const fulfillmentAt = new Date(Date.now() + 6 * 24 * 60 * 60 * 1000);
+  // Fulfillment window six days out, 11:30–14:00 in Ecuador (UTC-5, no DST) → 16:30–19:00 UTC, five 30-minute slots.
+  const fulfillmentDay = new Date(Date.now() + 6 * 24 * 60 * 60 * 1000);
+  const fulfillmentStartsAt = new Date(Date.UTC(fulfillmentDay.getUTCFullYear(), fulfillmentDay.getUTCMonth(), fulfillmentDay.getUTCDate(), 16, 30));
+  const fulfillmentEndsAt = new Date(Date.UTC(fulfillmentDay.getUTCFullYear(), fulfillmentDay.getUTCMonth(), fulfillmentDay.getUTCDate(), 19, 0));
   const [cycle] = await sql<{ id: string }[]>`
-    insert into sales_cycles (id, name, opens_at, closes_at, fulfillment_at, status, global_capacity, fulfillment_modes, public_message)
-    values ('00000000-0000-4000-8000-000000000001', 'Menú de esta semana', ${opensAt}, ${closesAt}, ${fulfillmentAt}, 'open', 60, '["delivery"]'::jsonb, 'Entrega gratuita en Ibarra. Pedidos abiertos hasta agotar cupos.')
+    insert into sales_cycles (id, name, opens_at, closes_at, fulfillment_starts_at, fulfillment_ends_at, slot_minutes, slot_capacity, status, global_capacity, fulfillment_modes, public_message)
+    values ('00000000-0000-4000-8000-000000000001', 'Menú de esta semana', ${opensAt}, ${closesAt}, ${fulfillmentStartsAt}, ${fulfillmentEndsAt}, 30, 4, 'open', 60, '["pickup","delivery"]'::jsonb, 'Entrega gratuita en Ibarra o retiro en el local. Elige tu franja al pagar.')
     on conflict (id) do update set name = excluded.name, opens_at = excluded.opens_at,
-      closes_at = excluded.closes_at, fulfillment_at = excluded.fulfillment_at,
-      status = 'open', global_capacity = excluded.global_capacity,
+      closes_at = excluded.closes_at, fulfillment_starts_at = excluded.fulfillment_starts_at,
+      fulfillment_ends_at = excluded.fulfillment_ends_at, slot_minutes = excluded.slot_minutes,
+      slot_capacity = excluded.slot_capacity, status = 'open', global_capacity = excluded.global_capacity,
       fulfillment_modes = excluded.fulfillment_modes, public_message = excluded.public_message
     returning id
   `;

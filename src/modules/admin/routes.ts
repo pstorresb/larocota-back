@@ -7,15 +7,46 @@ import { deleteUploadedProductImage, storeProductImage } from "../../common/stor
 import { loadModifierGroups } from "../catalog/configuration.js";
 import { requireAdmin, requireSuperadmin } from "../auth/guards.js";
 import { assertTransition, orderStatuses, type OrderStatus } from "../orders/state-machine.js";
-import { sendOrderStatusEmail } from "../../common/email/resend.js";
+import { assertCycleTransition, cycleStatuses, type CycleStatus } from "../cycles/cycle-status.js";
+import { buildSlots } from "../cycles/slots.js";
+import { getSetting } from "../settings/service.js";
+import { sendOrderStatusEmail, type OrderFulfillmentInfo } from "../../common/email/resend.js";
 
 const categorySchema = z.object({ name: z.string().trim().min(2).max(80), slug: z.string().regex(/^[a-z0-9-]+$/).max(80), description: z.string().max(500).optional(), sortOrder: z.number().int().min(0).default(0), isActive: z.boolean().default(true) });
 const productSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/).max(120), shortDescription: z.string().trim().min(5).max(300), description: z.string().max(2000).optional(), imageAlt: z.string().max(180).optional(), badge: z.string().max(40).optional(), basePrice: z.number().min(0).max(10000), taxRate: z.number().min(0).max(1), sortOrder: z.number().int().min(0).default(0), isActive: z.boolean().default(true) });
-const cycleSchema = z.object({ name: z.string().trim().min(2).max(120), opensAt: z.coerce.date(), closesAt: z.coerce.date(), fulfillmentAt: z.coerce.date(), globalCapacity: z.number().int().positive().nullable().default(null), fulfillmentModes: z.array(z.enum(["pickup", "delivery"])).min(1), publicMessage: z.string().max(500).optional() }).refine((value) => value.opensAt < value.closesAt && value.closesAt < value.fulfillmentAt, "Las fechas del ciclo no están en orden.");
+const cycleBaseSchema = z.object({
+  name: z.string().trim().min(2).max(120),
+  opensAt: z.coerce.date(),
+  closesAt: z.coerce.date(),
+  fulfillmentStartsAt: z.coerce.date(),
+  fulfillmentEndsAt: z.coerce.date(),
+  slotMinutes: z.union([z.literal(30), z.literal(60)]).default(60),
+  /** Orders per slot; null = unlimited. */
+  slotCapacity: z.number().int().positive().nullable().default(null),
+  globalCapacity: z.number().int().positive().nullable().default(null),
+  fulfillmentModes: z.array(z.enum(["pickup", "delivery"])).min(1),
+  publicMessage: z.string().max(500).optional(),
+});
+type CycleDates = { opensAt: Date; closesAt: Date; fulfillmentStartsAt: Date; fulfillmentEndsAt: Date; slotMinutes: number };
+/** Shared by create and update (after merging with the stored row). Returns the Spanish error or null. */
+function validateCycleDates(cycle: CycleDates): string | null {
+  if (!(cycle.opensAt < cycle.closesAt && cycle.closesAt < cycle.fulfillmentStartsAt && cycle.fulfillmentStartsAt < cycle.fulfillmentEndsAt)) return "Las fechas del ciclo no están en orden.";
+  const windowMs = cycle.fulfillmentEndsAt.getTime() - cycle.fulfillmentStartsAt.getTime();
+  if (windowMs > 24 * 3_600_000) return "La ventana de entrega no puede superar 24 horas.";
+  if (windowMs % (cycle.slotMinutes * 60_000) !== 0) return `La ventana de entrega debe ser un múltiplo de la franja (${cycle.slotMinutes} min).`;
+  return null;
+}
+const cycleSchema = cycleBaseSchema.superRefine((value, context) => {
+  const problem = validateCycleDates(value);
+  if (problem) context.addIssue({ code: "custom", path: ["fulfillmentEndsAt"], message: problem });
+});
 const categoryUpdateSchema = categorySchema.partial().refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
 const productUpdateSchema = productSchema.partial().refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
-const cycleStatusSchema = z.enum(["draft", "scheduled", "open", "closed", "fulfilled", "cancelled"]);
-const cycleUpdateSchema = z.object({ name: z.string().trim().min(2).max(120).optional(), opensAt: z.coerce.date().optional(), closesAt: z.coerce.date().optional(), fulfillmentAt: z.coerce.date().optional(), globalCapacity: z.number().int().positive().nullable().optional(), fulfillmentModes: z.array(z.enum(["pickup", "delivery"])).min(1).optional(), publicMessage: z.string().max(500).nullable().optional(), status: cycleStatusSchema.optional() }).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
+const cycleStatusSchema = z.enum(cycleStatuses);
+const cycleUpdateSchema = cycleBaseSchema.partial().extend({
+  publicMessage: z.string().max(500).nullable().optional(),
+  status: cycleStatusSchema.optional(),
+}).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
 const cycleProductsSchema = z.object({ products: z.array(z.object({ productId: z.string().uuid(), capacity: z.number().int().positive().nullable().default(null), priceOverride: z.number().min(0).nullable().default(null), isAvailable: z.boolean().default(true), sortOrder: z.number().int().min(0).default(0) })).max(500) });
 const modifierOptionSchema = z.object({ id: z.string().uuid().optional(), name: z.string().trim().min(1).max(100), description: z.string().max(300).optional(), priceDelta: z.number().min(0).max(10000), includedQuantity: z.number().int().min(0).max(20), defaultQuantity: z.number().int().min(0).max(20), maxQuantity: z.number().int().min(1).max(20), isLocked: z.boolean().default(false), isActive: z.boolean().default(true), sortOrder: z.number().int().min(0).default(0) }).refine((option) => option.includedQuantity <= option.maxQuantity && option.defaultQuantity <= option.maxQuantity, "Las cantidades de una opción no son válidas.").refine((option) => !option.isLocked || (option.defaultQuantity > 0 && option.includedQuantity >= option.defaultQuantity), "Una opción fija debe estar incluida y preseleccionada.");
 const modifierGroupSchema = z.object({ id: z.string().uuid().optional(), name: z.string().trim().min(2).max(100), description: z.string().max(300).optional(), selectionType: z.enum(["single", "multiple"]), minSelections: z.number().int().min(0).max(50), maxSelections: z.number().int().min(1).max(50), isActive: z.boolean().default(true), sortOrder: z.number().int().min(0).default(0), options: z.array(modifierOptionSchema).max(100) }).superRefine((group, context) => {
@@ -47,11 +78,30 @@ const updateUserSchema = z.object({
   status: userStatusSchema.optional(),
 }).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
 
+type OrderNotificationRow = {
+  id: string; status: OrderStatus; orderNumber: string; fulfillmentType: string;
+  contactSnapshot: { email: string; firstName: string };
+  addressSnapshot: { addressLine?: string } | null;
+  slotStartsAt: Date | null; slotEndsAt: Date | null;
+};
+
 export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
   return async (app) => {
+    /** Slot and place for status emails; the pickup point comes from store settings, not from the order. */
+    async function fulfillmentInfo(order: OrderNotificationRow): Promise<OrderFulfillmentInfo> {
+      const pickup = order.fulfillmentType === "pickup" ? await getSetting(sql, "pickup") : null;
+      return {
+        slotStartsAt: order.slotStartsAt,
+        slotEndsAt: order.slotEndsAt,
+        addressLine: order.addressSnapshot?.addressLine ?? null,
+        pickupAddress: pickup?.addressLine || null,
+        pickupReference: pickup?.reference || null,
+      };
+    }
+
     app.get<{ Querystring: { cycleId?: string } }>("/admin/dashboard", async (request) => {
       await requireAdmin(sql, env, request);
-      const [cycle] = request.query.cycleId ? await sql`select id, name, global_capacity from sales_cycles where id = ${request.query.cycleId}` : await sql`select id, name, global_capacity from sales_cycles order by fulfillment_at desc limit 1`;
+      const [cycle] = request.query.cycleId ? await sql`select id, name, global_capacity from sales_cycles where id = ${request.query.cycleId}` : await sql`select id, name, global_capacity from sales_cycles order by fulfillment_starts_at desc limit 1`;
       if (!cycle) return { cycle: null, metrics: { orders: 0, sales: "0", averageTicket: "0", pendingPayments: 0 }, products: [] };
       const [metrics] = await sql`
         select count(*)::int as orders,
@@ -107,16 +157,56 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
     app.get("/admin/cycles", async (request) => {
       await requireAdmin(sql, env, request);
       const cycles = await sql`
-        select sc.id, sc.name, sc.opens_at, sc.closes_at, sc.fulfillment_at, sc.status,
+        select sc.id, sc.name, sc.opens_at, sc.closes_at, sc.fulfillment_starts_at, sc.fulfillment_ends_at,
+          sc.slot_minutes, sc.slot_capacity, sc.status,
           sc.global_capacity, sc.fulfillment_modes, sc.public_message, sc.created_at,
           count(distinct cp.product_id)::int as product_count,
-          count(distinct o.id)::int as order_count
+          count(distinct o.id)::int as order_count,
+          count(distinct o.id) filter (where o.status <> 'cancelled')::int as active_order_count
         from sales_cycles sc
         left join cycle_products cp on cp.cycle_id = sc.id
         left join orders o on o.sales_cycle_id = sc.id
-        group by sc.id order by sc.fulfillment_at desc
+        group by sc.id order by sc.fulfillment_starts_at desc
       `;
       return { cycles };
+    });
+
+    // Occupancy per fulfillment slot, for the admin's "Franjas" view.
+    app.get<{ Params: { cycleId: string } }>("/admin/cycles/:cycleId/slots", async (request, reply) => {
+      await requireAdmin(sql, env, request);
+      const [cycle] = await sql<{ id: string; name: string; fulfillmentStartsAt: Date; fulfillmentEndsAt: Date; slotMinutes: number; slotCapacity: number | null }[]>`
+        select id, name, fulfillment_starts_at, fulfillment_ends_at, slot_minutes, slot_capacity from sales_cycles where id = ${request.params.cycleId}
+      `;
+      if (!cycle) return reply.code(404).send({ code: "CYCLE_NOT_FOUND", message: "Ciclo no encontrado." });
+      type SlotOrder = { id: string; orderNumber: string; status: string; fulfillmentType: string; customerName: string };
+      const orders = await sql<{ slotStartsAt: Date | null; id: string; orderNumber: string; status: string; fulfillmentType: string; customerName: string }[]>`
+        select o.slot_starts_at, o.id, o.order_number, o.status, o.fulfillment_type,
+          concat_ws(' ', o.contact_snapshot->>'firstName', o.contact_snapshot->>'lastName') as customer_name
+        from orders o
+        where o.sales_cycle_id = ${cycle.id} and o.status <> 'cancelled'
+        order by o.created_at
+      `;
+      const bySlot = new Map<number, SlotOrder[]>();
+      const unassigned: SlotOrder[] = [];
+      for (const order of orders) {
+        const item: SlotOrder = { id: order.id, orderNumber: order.orderNumber, status: order.status, fulfillmentType: order.fulfillmentType, customerName: order.customerName };
+        if (!order.slotStartsAt) { unassigned.push(item); continue; }
+        const key = new Date(order.slotStartsAt).getTime();
+        bySlot.set(key, [...(bySlot.get(key) ?? []), item]);
+      }
+      const slots = buildSlots(cycle).map((slot) => {
+        const items = bySlot.get(slot.startsAt.getTime()) ?? [];
+        return {
+          startsAt: slot.startsAt.toISOString(),
+          endsAt: slot.endsAt.toISOString(),
+          capacity: cycle.slotCapacity,
+          orders: items.length,
+          pickup: items.filter((item) => item.fulfillmentType === "pickup").length,
+          delivery: items.filter((item) => item.fulfillmentType === "delivery").length,
+          items,
+        };
+      });
+      return { cycle, slots, unassigned };
     });
 
     app.get<{ Params: { cycleId: string } }>("/admin/cycles/:cycleId/products", async (request, reply) => {
@@ -132,6 +222,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       const search = request.query.search ? `%${request.query.search}%` : null;
       const orders = await sql`
         select o.id, o.order_number, o.status, o.total, o.currency, o.fulfillment_type, o.created_at,
+          o.slot_starts_at, o.slot_ends_at,
           u.first_name, u.last_name, u.email
         from orders o join users u on u.id = o.user_id
         where (${request.query.cycleId ?? null}::uuid is null or o.sales_cycle_id = ${request.query.cycleId ?? null})
@@ -147,7 +238,8 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       const [order] = await sql`
         select o.id, o.order_number, o.status, o.fulfillment_type, o.contact_snapshot, o.address_snapshot,
           o.customer_notes, o.admin_public_note, o.admin_private_note, o.currency, o.subtotal, o.tax_total,
-          o.total, o.created_at, o.submitted_at, o.confirmed_at, sc.fulfillment_at,
+          o.total, o.created_at, o.submitted_at, o.confirmed_at, o.slot_starts_at, o.slot_ends_at,
+          sc.fulfillment_starts_at, sc.fulfillment_ends_at,
           (select min(sr.expires_at) from stock_reservations sr where sr.order_id = o.id and sr.status = 'reserved') as payment_deadline,
           u.first_name, u.last_name, u.email
         from orders o
@@ -237,7 +329,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       const parsed = z.object({ status: z.enum(orderStatuses), publicNote: z.string().max(500).optional(), privateNote: z.string().max(1000).optional() }).safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Estado u observación inválidos." });
       const updated = await sql.begin(async (tx) => {
-        const [order] = await tx<{ id: string; status: OrderStatus; orderNumber: string; fulfillmentType: string; contactSnapshot: { email: string; firstName: string } }[]>`select id, status, order_number, fulfillment_type, contact_snapshot from orders where id = ${request.params.orderId} for update`;
+        const [order] = await tx<OrderNotificationRow[]>`select id, status, order_number, fulfillment_type, contact_snapshot, address_snapshot, slot_starts_at, slot_ends_at from orders where id = ${request.params.orderId} for update`;
         if (!order) throw Object.assign(new Error("Pedido no encontrado."), { statusCode: 404 });
         assertTransition(order.status, parsed.data.status);
         const [result] = await tx`
@@ -248,7 +340,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         await tx`insert into order_status_history (order_id, from_status, to_status, actor_user_id, public_note, private_note) values (${order.id}, ${order.status}, ${parsed.data.status}, ${user.id}, ${parsed.data.publicNote ?? null}, ${parsed.data.privateNote ?? null})`;
         await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'order', ${order.id}, 'status_changed', ${tx.json({ status: order.status })}, ${tx.json({ status: parsed.data.status })})`;
         if (parsed.data.status === "cancelled") await tx`update stock_reservations set status = 'released' where order_id = ${order.id} and status in ('reserved', 'committed')`;
-        return { result, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: parsed.data.status, fulfillmentType: order.fulfillmentType, note: parsed.data.publicNote ?? null } };
+        return { result, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: parsed.data.status, fulfillmentType: order.fulfillmentType, note: parsed.data.publicNote ?? null, fulfillment: await fulfillmentInfo(order) } };
       });
       try { await sendOrderStatusEmail(env, updated.notification); } catch (error) { request.log.error({ err: error, orderId: updated.result.id }, "Could not send order status email"); }
       return { order: updated.result };
@@ -263,7 +355,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         const [proof] = await tx<{ id: string; orderId: string; status: string }[]>`select id, order_id, status from payment_proofs where id = ${request.params.proofId} for update`;
         if (!proof) throw Object.assign(new Error("Comprobante no encontrado."), { statusCode: 404 });
         if (proof.status !== "under_review") throw Object.assign(new Error("El comprobante ya fue revisado."), { statusCode: 409 });
-        const [order] = await tx<{ id: string; status: OrderStatus; orderNumber: string; fulfillmentType: string; contactSnapshot: { email: string; firstName: string } }[]>`select id, status, order_number, fulfillment_type, contact_snapshot from orders where id = ${proof.orderId} for update`;
+        const [order] = await tx<OrderNotificationRow[]>`select id, status, order_number, fulfillment_type, contact_snapshot, address_snapshot, slot_starts_at, slot_ends_at from orders where id = ${proof.orderId} for update`;
         if (!order || order.status !== "payment_review") throw Object.assign(new Error("El pedido no está listo para revisión."), { statusCode: 409 });
         const approved = parsed.data.decision === "approve";
         const nextStatus: OrderStatus = approved ? "confirmed" : "payment_rejected";
@@ -275,7 +367,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         if (approved) await tx`update stock_reservations set status = 'committed' where order_id = ${order.id} and status = 'reserved'`;
         // A rejected proof reopens the payment window so the customer can upload a new one; expiry cancels it otherwise.
         else await tx`update stock_reservations set expires_at = now() + (${env.PAYMENT_WINDOW_HOURS}::numeric * interval '1 hour') where order_id = ${order.id} and status = 'reserved'`;
-        return { proofId: proof.id, orderId: order.id, orderStatus: nextStatus, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: nextStatus, fulfillmentType: order.fulfillmentType, note: reason } };
+        return { proofId: proof.id, orderId: order.id, orderStatus: nextStatus, notification: { email: order.contactSnapshot.email, firstName: order.contactSnapshot.firstName, orderNumber: order.orderNumber, status: nextStatus, fulfillmentType: order.fulfillmentType, note: reason, fulfillment: await fulfillmentInfo(order) } };
       });
       try { await sendOrderStatusEmail(env, result.notification); } catch (error) { request.log.error({ err: error, orderId: result.orderId }, "Could not send payment review email"); }
       return { result: { proofId: result.proofId, orderId: result.orderId, orderStatus: result.orderStatus } };
@@ -407,8 +499,13 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
 
     app.post("/admin/cycles", async (request, reply) => {
       const user = await requireAdmin(sql, env, request); const parsed = cycleSchema.safeParse(request.body);
-      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa las fechas y capacidad del ciclo." });
-      const [cycle] = await sql`insert into sales_cycles (name, opens_at, closes_at, fulfillment_at, status, global_capacity, fulfillment_modes, public_message) values (${parsed.data.name}, ${parsed.data.opensAt}, ${parsed.data.closesAt}, ${parsed.data.fulfillmentAt}, 'draft', ${parsed.data.globalCapacity}, ${sql.json(parsed.data.fulfillmentModes)}, ${parsed.data.publicMessage ?? null}) returning *`;
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: parsed.error.issues[0]?.message ?? "Revisa las fechas y capacidad del ciclo." });
+      const data = parsed.data;
+      const [cycle] = await sql`
+        insert into sales_cycles (name, opens_at, closes_at, fulfillment_starts_at, fulfillment_ends_at, slot_minutes, slot_capacity, status, global_capacity, fulfillment_modes, public_message)
+        values (${data.name}, ${data.opensAt}, ${data.closesAt}, ${data.fulfillmentStartsAt}, ${data.fulfillmentEndsAt}, ${data.slotMinutes}, ${data.slotCapacity}, 'draft', ${data.globalCapacity}, ${sql.json(data.fulfillmentModes)}, ${data.publicMessage ?? null})
+        returning *
+      `;
       if (!cycle) throw new Error("Cycle creation failed");
       await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'sales_cycle', ${cycle.id}, 'created', ${sql.json(cycle)})`;
       return reply.code(201).send({ cycle });
@@ -416,28 +513,136 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
 
     app.patch<{ Params: { cycleId: string } }>("/admin/cycles/:cycleId", async (request, reply) => {
       const user = await requireAdmin(sql, env, request); const parsed = cycleUpdateSchema.safeParse(request.body);
-      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa el ciclo." });
-      const [before] = await sql`select * from sales_cycles where id = ${request.params.cycleId}`;
-      if (!before) return reply.code(404).send({ code: "CYCLE_NOT_FOUND", message: "Ciclo no encontrado." });
-      const dates = { opensAt: parsed.data.opensAt ?? before.opensAt, closesAt: parsed.data.closesAt ?? before.closesAt, fulfillmentAt: parsed.data.fulfillmentAt ?? before.fulfillmentAt };
-      if (!(dates.opensAt < dates.closesAt && dates.closesAt < dates.fulfillmentAt)) return reply.code(400).send({ code: "INVALID_DATES", message: "Las fechas del ciclo no están en orden." });
-      const [cycle] = await sql`update sales_cycles set name = coalesce(${parsed.data.name ?? null}, name), opens_at = coalesce(${parsed.data.opensAt ?? null}, opens_at), closes_at = coalesce(${parsed.data.closesAt ?? null}, closes_at), fulfillment_at = coalesce(${parsed.data.fulfillmentAt ?? null}, fulfillment_at), global_capacity = case when ${parsed.data.globalCapacity === null} then null else coalesce(${parsed.data.globalCapacity ?? null}, global_capacity) end, fulfillment_modes = coalesce(${parsed.data.fulfillmentModes ? sql.json(parsed.data.fulfillmentModes) : null}::jsonb, fulfillment_modes), public_message = case when ${parsed.data.publicMessage === null || parsed.data.publicMessage === ""} then null else coalesce(${parsed.data.publicMessage ?? null}, public_message) end, status = coalesce(${parsed.data.status ?? null}::sales_cycle_status, status) where id = ${before.id} returning *`;
-      if (!cycle) throw new Error("Cycle update failed");
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'sales_cycle', ${before.id}, 'updated', ${sql.json(before)}, ${sql.json(cycle)})`;
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: parsed.error.issues[0]?.message ?? "Revisa el ciclo." });
+      const patch = parsed.data;
+      type CycleRow = {
+        id: string; name: string; opensAt: Date; closesAt: Date; fulfillmentStartsAt: Date; fulfillmentEndsAt: Date;
+        slotMinutes: number; slotCapacity: number | null; status: CycleStatus; globalCapacity: number | null;
+        fulfillmentModes: string[]; publicMessage: string | null;
+      };
+      const cycle = await sql.begin(async (tx) => {
+        const [before] = await tx<CycleRow[]>`select * from sales_cycles where id = ${request.params.cycleId} for update`;
+        if (!before) throw Object.assign(new Error("Ciclo no encontrado."), { statusCode: 404, code: "CYCLE_NOT_FOUND" });
+        const merged = {
+          opensAt: patch.opensAt ?? before.opensAt,
+          closesAt: patch.closesAt ?? before.closesAt,
+          fulfillmentStartsAt: patch.fulfillmentStartsAt ?? before.fulfillmentStartsAt,
+          fulfillmentEndsAt: patch.fulfillmentEndsAt ?? before.fulfillmentEndsAt,
+          slotMinutes: patch.slotMinutes ?? before.slotMinutes,
+        };
+        const problem = validateCycleDates(merged);
+        if (problem) throw Object.assign(new Error(problem), { statusCode: 400, code: "INVALID_DATES" });
+
+        const [{ activeOrders = 0, maxPerSlot = 0 } = { activeOrders: 0, maxPerSlot: 0 }] = await tx<{ activeOrders: number; maxPerSlot: number }[]>`
+          select count(*)::int as active_orders,
+            coalesce(max(per_slot.orders), 0)::int as max_per_slot
+          from orders o
+          left join lateral (
+            select count(*)::int as orders from orders s
+            where s.sales_cycle_id = o.sales_cycle_id and s.slot_starts_at = o.slot_starts_at and s.status <> 'cancelled'
+          ) per_slot on true
+          where o.sales_cycle_id = ${before.id} and o.status <> 'cancelled'
+        `;
+        const windowChanged = merged.fulfillmentStartsAt.getTime() !== before.fulfillmentStartsAt.getTime()
+          || merged.fulfillmentEndsAt.getTime() !== before.fulfillmentEndsAt.getTime()
+          || merged.slotMinutes !== before.slotMinutes;
+        if (windowChanged && activeOrders > 0) throw Object.assign(new Error("Ya hay pedidos con franja asignada; no puedes cambiar la ventana de entrega."), { statusCode: 409, code: "CYCLE_HAS_ORDERS" });
+        if (patch.slotCapacity !== undefined && patch.slotCapacity !== null && patch.slotCapacity < maxPerSlot) throw Object.assign(new Error("Hay franjas con más pedidos que el nuevo límite."), { statusCode: 409, code: "CYCLE_HAS_ORDERS" });
+
+        if (patch.globalCapacity !== undefined && patch.globalCapacity !== null) {
+          const [{ reserved = 0 } = { reserved: 0 }] = await tx<{ reserved: number }[]>`
+            select coalesce(sum(quantity), 0)::int as reserved from stock_reservations
+            where cycle_id = ${before.id} and (status = 'committed' or (status = 'reserved' and (expires_at is null or expires_at > now())))
+          `;
+          if (patch.globalCapacity < reserved) throw Object.assign(new Error(`Ya hay ${reserved} unidades reservadas; el cupo global no puede ser menor.`), { statusCode: 409, code: "CAPACITY_BELOW_RESERVED" });
+        }
+
+        if (patch.status && patch.status !== before.status) {
+          assertCycleTransition(before.status, patch.status);
+          if (patch.status === "scheduled" || patch.status === "open") {
+            const [{ products = 0 } = { products: 0 }] = await tx<{ products: number }[]>`select count(*)::int as products from cycle_products where cycle_id = ${before.id}`;
+            if (products === 0) throw Object.assign(new Error("Agrega productos al ciclo antes de publicarlo."), { statusCode: 409, code: "CYCLE_EMPTY" });
+          }
+          if (patch.status === "cancelled") {
+            const [{ inFlight = 0 } = { inFlight: 0 }] = await tx<{ inFlight: number }[]>`
+              select count(*)::int as in_flight from orders where sales_cycle_id = ${before.id} and status in ('confirmed', 'in_preparation', 'ready', 'out_for_delivery')
+            `;
+            if (inFlight > 0) throw Object.assign(new Error("El ciclo tiene pedidos confirmados. Entrégalos o cancélalos primero."), { statusCode: 409, code: "CYCLE_HAS_ORDERS" });
+          }
+        }
+
+        const [after] = await tx<CycleRow[]>`
+          update sales_cycles set
+            name = coalesce(${patch.name ?? null}, name),
+            opens_at = ${merged.opensAt}, closes_at = ${merged.closesAt},
+            fulfillment_starts_at = ${merged.fulfillmentStartsAt}, fulfillment_ends_at = ${merged.fulfillmentEndsAt},
+            slot_minutes = ${merged.slotMinutes},
+            slot_capacity = case when ${patch.slotCapacity === null} then null else coalesce(${patch.slotCapacity ?? null}, slot_capacity) end,
+            global_capacity = case when ${patch.globalCapacity === null} then null else coalesce(${patch.globalCapacity ?? null}, global_capacity) end,
+            fulfillment_modes = coalesce(${patch.fulfillmentModes ? tx.json(patch.fulfillmentModes) : null}::jsonb, fulfillment_modes),
+            public_message = case when ${patch.publicMessage === null || patch.publicMessage === ""} then null else coalesce(${patch.publicMessage ?? null}, public_message) end,
+            status = coalesce(${patch.status ?? null}::sales_cycle_status, status)
+          where id = ${before.id} returning *
+        `;
+        if (!after) throw new Error("Cycle update failed");
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'sales_cycle', ${before.id}, 'updated', ${tx.json(before)}, ${tx.json(after)})`;
+        return after;
+      });
       return { cycle };
     });
 
     app.put<{ Params: { cycleId: string } }>("/admin/cycles/:cycleId/products", async (request, reply) => {
       const user = await requireAdmin(sql, env, request); const parsed = cycleProductsSchema.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa los productos y cupos del ciclo." });
-      const [cycle] = await sql`select id from sales_cycles where id = ${request.params.cycleId}`;
-      if (!cycle) return reply.code(404).send({ code: "CYCLE_NOT_FOUND", message: "Ciclo no encontrado." });
       await sql.begin(async (tx) => {
+        const [cycle] = await tx<{ id: string }[]>`select id from sales_cycles where id = ${request.params.cycleId} for update`;
+        if (!cycle) throw Object.assign(new Error("Ciclo no encontrado."), { statusCode: 404, code: "CYCLE_NOT_FOUND" });
+        // Products with live reservations can be hidden (is_available=false stops new sales) but not removed
+        // or capped below what customers already hold.
+        const reserved = await tx<{ productId: string; name: string; reserved: number }[]>`
+          select sr.product_id, p.name, sum(sr.quantity)::int as reserved
+          from stock_reservations sr join products p on p.id = sr.product_id
+          where sr.cycle_id = ${cycle.id}
+            and (sr.status = 'committed' or (sr.status = 'reserved' and (sr.expires_at is null or sr.expires_at > now())))
+          group by sr.product_id, p.name
+        `;
+        const incoming = new Map(parsed.data.products.map((product) => [product.productId, product]));
+        for (const row of reserved) {
+          const next = incoming.get(row.productId);
+          if (!next || (next.capacity !== null && next.capacity < row.reserved)) {
+            throw Object.assign(new Error(`«${row.name}» ya tiene ${row.reserved} unidades reservadas; no puedes quitarlo ni bajar su cupo por debajo.`), { statusCode: 409, code: "PRODUCT_RESERVED" });
+          }
+        }
         await tx`delete from cycle_products where cycle_id = ${cycle.id}`;
         for (const product of parsed.data.products) await tx`insert into cycle_products (cycle_id, product_id, capacity, price_override, is_available, sort_order) values (${cycle.id}, ${product.productId}, ${product.capacity}, ${product.priceOverride?.toFixed(2) ?? null}, ${product.isAvailable}, ${product.sortOrder})`;
         await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'sales_cycle', ${cycle.id}, 'products_replaced', ${tx.json(parsed.data.products)})`;
       });
       return { products: parsed.data.products };
+    });
+
+    // Copies a cycle (and its products) one week later as a draft, so weekly menus don't start from scratch.
+    app.post<{ Params: { cycleId: string } }>("/admin/cycles/:cycleId/duplicate", async (request, reply) => {
+      const user = await requireAdmin(sql, env, request);
+      const cycle = await sql.begin(async (tx) => {
+        const [source] = await tx<{ id: string; name: string }[]>`select id, name from sales_cycles where id = ${request.params.cycleId}`;
+        if (!source) throw Object.assign(new Error("Ciclo no encontrado."), { statusCode: 404, code: "CYCLE_NOT_FOUND" });
+        const [copy] = await tx<{ id: string }[]>`
+          insert into sales_cycles (name, opens_at, closes_at, fulfillment_starts_at, fulfillment_ends_at, slot_minutes, slot_capacity, status, global_capacity, fulfillment_modes, public_message)
+          select ${`${source.name} (copia)`}, opens_at + interval '7 days', closes_at + interval '7 days',
+            fulfillment_starts_at + interval '7 days', fulfillment_ends_at + interval '7 days',
+            slot_minutes, slot_capacity, 'draft', global_capacity, fulfillment_modes, public_message
+          from sales_cycles where id = ${source.id}
+          returning *
+        `;
+        if (!copy) throw new Error("Cycle duplication failed");
+        await tx`
+          insert into cycle_products (cycle_id, product_id, capacity, price_override, is_available, sort_order)
+          select ${copy.id}, product_id, capacity, price_override, is_available, sort_order from cycle_products where cycle_id = ${source.id}
+        `;
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'sales_cycle', ${copy.id}, 'duplicated', ${tx.json({ sourceId: source.id })}, ${tx.json(copy)})`;
+        return copy;
+      });
+      return reply.code(201).send({ cycle });
     });
 
     app.delete<{ Params: { cycleId: string } }>("/admin/cycles/:cycleId", async (request, reply) => {

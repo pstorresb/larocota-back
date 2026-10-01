@@ -35,7 +35,51 @@ const orderCopy: Record<string, { title: string; body: string }> = {
   cancelled: { title: "Tu pedido fue cancelado", body: "Tu pedido quedó cancelado y liberamos los cupos reservados. Si crees que es un error, escríbenos." },
 };
 
-export type OrderStatusEmail = { email: string; firstName: string; orderNumber: string; status: string; fulfillmentType: string; note?: string | null };
+/** Where and when the order will be fulfilled; used to enrich confirmation and ready emails. */
+export type OrderFulfillmentInfo = {
+  slotStartsAt: Date | string | null;
+  slotEndsAt: Date | string | null;
+  /** Delivery orders: the customer's address line. */
+  addressLine?: string | null;
+  /** Pickup orders: the shop's pickup point. */
+  pickupAddress?: string | null;
+  pickupReference?: string | null;
+};
+
+export type OrderStatusEmail = {
+  email: string; firstName: string; orderNumber: string; status: string; fulfillmentType: string;
+  note?: string | null; fulfillment?: OrderFulfillmentInfo | null;
+};
+
+const slotDay = new Intl.DateTimeFormat("es-EC", { timeZone: "America/Guayaquil", weekday: "long", day: "numeric", month: "long" });
+const slotTime = new Intl.DateTimeFormat("es-EC", { timeZone: "America/Guayaquil", hour: "2-digit", minute: "2-digit", hour12: false });
+
+/** "viernes 3 de octubre, 11:30–12:00" in Ecuador time; null when the order has no slot (legacy). */
+export function formatSlot(startsAt: Date | string | null | undefined, endsAt: Date | string | null | undefined) {
+  if (!startsAt || !endsAt) return null;
+  const start = new Date(startsAt);
+  const end = new Date(endsAt);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  return `${slotDay.format(start)}, ${slotTime.format(start)}–${slotTime.format(end)}`;
+}
+
+/** One extra sentence with the slot and place, only for statuses where it helps the customer act. */
+function fulfillmentLine(input: OrderStatusEmail) {
+  const info = input.fulfillment;
+  if (!info) return null;
+  const slot = formatSlot(info.slotStartsAt, info.slotEndsAt);
+  const pickup = input.fulfillmentType === "pickup";
+  const place = pickup
+    ? [info.pickupAddress?.trim(), info.pickupReference?.trim()].filter(Boolean).join(" · ") || null
+    : info.addressLine?.trim() || null;
+  if (input.status === "confirmed") {
+    if (pickup) return slot || place ? `Te esperamos${slot ? ` el ${slot}` : ""}${place ? ` en ${place}` : ""}.` : null;
+    return slot || place ? `Lo entregaremos${slot ? ` el ${slot}` : ""}${place ? ` en ${place}` : ""}.` : null;
+  }
+  if (input.status === "ready" && pickup) return `${place ? `Retíralo en ${place}` : "Retíralo en el local"}${slot ? `, en tu franja: ${slot}` : ""}.`;
+  if (input.status === "out_for_delivery" && !pickup) return `${place ? `Va hacia ${place}` : "Va hacia tu dirección"}${slot ? `, franja ${slot}` : ""}.`;
+  return null;
+}
 
 /** Sends the customer-facing email for a status change. Statuses without copy (draft, payment_pending, payment_review) send nothing. */
 export async function sendOrderStatusEmail(env: AppEnv, input: OrderStatusEmail) {
@@ -44,12 +88,13 @@ export async function sendOrderStatusEmail(env: AppEnv, input: OrderStatusEmail)
   const name = escapeHtml(input.firstName || "hola");
   const orderNumber = escapeHtml(input.orderNumber);
   const detail = input.status === "ready" && input.fulfillmentType === "pickup" ? "Ya puedes acercarte a retirarlo." : copy.body;
+  const extra = fulfillmentLine(input);
   const note = input.note?.trim() ? input.note.trim() : null;
   const noteLabel = input.status === "payment_rejected" ? "Motivo" : "Nota";
   await sendEmail(env, {
     to: input.email,
     subject: `${copy.title} · ${input.orderNumber}`,
-    text: `Hola ${input.firstName || ""}, ${detail}${note ? ` ${noteLabel}: ${note}.` : ""} Pedido ${input.orderNumber}.`,
-    html: `<div style="font-family:Arial,sans-serif;color:#211f1c"><p>Hola ${name},</p><h2>${copy.title}</h2><p>${escapeHtml(detail)}</p>${note ? `<p style="border-left:3px solid #e92b25;padding:8px 12px;background:#faf8f5"><strong>${noteLabel}:</strong> ${escapeHtml(note)}</p>` : ""}<p><strong>Pedido ${orderNumber}</strong></p></div>`,
+    text: `Hola ${input.firstName || ""}, ${detail}${extra ? ` ${extra}` : ""}${note ? ` ${noteLabel}: ${note}.` : ""} Pedido ${input.orderNumber}.`,
+    html: `<div style="font-family:Arial,sans-serif;color:#211f1c"><p>Hola ${name},</p><h2>${copy.title}</h2><p>${escapeHtml(detail)}</p>${extra ? `<p><strong>${escapeHtml(extra)}</strong></p>` : ""}${note ? `<p style="border-left:3px solid #e92b25;padding:8px 12px;background:#faf8f5"><strong>${noteLabel}:</strong> ${escapeHtml(note)}</p>` : ""}<p><strong>Pedido ${orderNumber}</strong></p></div>`,
   });
 }
