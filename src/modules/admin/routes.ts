@@ -43,7 +43,18 @@ const cycleSchema = cycleBaseSchema.superRefine((value, context) => {
 const categoryUpdateSchema = categorySchema.partial().refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
 const productUpdateSchema = productSchema.partial().refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
 const cycleStatusSchema = z.enum(cycleStatuses);
-const cycleUpdateSchema = cycleBaseSchema.partial().extend({
+// Written out instead of `cycleBaseSchema.partial()`: partial() keeps the create defaults, so a status-only
+// PATCH would arrive with slotMinutes 60 and both capacities null and silently overwrite the cycle.
+export const cycleUpdateSchema = z.object({
+  name: z.string().trim().min(2).max(120).optional(),
+  opensAt: z.coerce.date().optional(),
+  closesAt: z.coerce.date().optional(),
+  fulfillmentStartsAt: z.coerce.date().optional(),
+  fulfillmentEndsAt: z.coerce.date().optional(),
+  slotMinutes: z.union([z.literal(30), z.literal(60)]).optional(),
+  slotCapacity: z.number().int().positive().nullable().optional(),
+  globalCapacity: z.number().int().positive().nullable().optional(),
+  fulfillmentModes: z.array(z.enum(["pickup", "delivery"])).min(1).optional(),
   publicMessage: z.string().max(500).nullable().optional(),
   status: cycleStatusSchema.optional(),
 }).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
@@ -559,6 +570,10 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
 
         if (patch.status && patch.status !== before.status) {
           assertCycleTransition(before.status, patch.status);
+          // Opening (or reopening) a cycle whose closing date already passed would be undone by the next maintenance run.
+          if (patch.status === "open" && merged.closesAt.getTime() <= Date.now()) {
+            throw Object.assign(new Error("Para abrir los pedidos, mueve el cierre a una fecha futura."), { statusCode: 400, code: "INVALID_DATES" });
+          }
           if (patch.status === "scheduled" || patch.status === "open") {
             const [{ products = 0 } = { products: 0 }] = await tx<{ products: number }[]>`select count(*)::int as products from cycle_products where cycle_id = ${before.id}`;
             if (products === 0) throw Object.assign(new Error("Agrega productos al ciclo antes de publicarlo."), { statusCode: 409, code: "CYCLE_EMPTY" });

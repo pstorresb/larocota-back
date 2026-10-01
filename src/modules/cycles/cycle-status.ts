@@ -7,19 +7,20 @@ export const cycleStatusLabels: Record<CycleStatus, string> = {
   scheduled: "Programado",
   open: "Abierto",
   closed: "Cerrado",
-  fulfilled: "Cumplido",
+  fulfilled: "Entregado",
   cancelled: "Cancelado",
 };
 
 /**
  * Admin-driven transitions. The maintenance job also moves scheduled → open → closed by dates;
- * "open" from "scheduled" here is the manual "abrir ahora" override.
+ * "open" from "scheduled" here is the manual "abrir ahora" override, and "open" from "closed" reopens
+ * ordering (the route requires the closing date to be in the future, or maintenance would close it again).
  */
 const allowed: Record<CycleStatus, readonly CycleStatus[]> = {
   draft: ["scheduled", "cancelled"],
   scheduled: ["draft", "open", "cancelled"],
   open: ["closed", "cancelled"],
-  closed: ["fulfilled", "cancelled"],
+  closed: ["open", "fulfilled", "cancelled"],
   fulfilled: [],
   cancelled: [],
 };
