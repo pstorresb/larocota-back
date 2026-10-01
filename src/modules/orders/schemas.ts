@@ -8,7 +8,7 @@ export const selectionsSchema = z.array(z.object({
 export const quoteSchema = z.object({
   cycleId: z.string().uuid(),
   items: z.array(z.object({
-    productId: z.string().min(1),
+    productId: z.string().uuid(),
     quantity: z.number().int().min(1).max(20),
     selections: selectionsSchema,
   })).min(1).max(30),

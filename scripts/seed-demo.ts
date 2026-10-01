@@ -133,9 +133,9 @@ try {
   const categoryIds = new Map<string, string>();
   for (const category of categorySeeds) {
     const [saved] = await sql<{ id: string }[]>`
-      insert into categories (name, slug, description, sort_order, is_active)
-      values (${category.name}, ${category.slug}, ${category.description}, ${category.sortOrder}, true)
-      on conflict (slug) do update set name = excluded.name, description = excluded.description,
+      insert into categories (name, slug, sort_order, is_active)
+      values (${category.name}, ${category.slug}, ${category.sortOrder}, true)
+      on conflict (slug) do update set name = excluded.name,
         sort_order = excluded.sort_order, is_active = true
       returning id
     `;
@@ -149,10 +149,10 @@ try {
     const categoryId = categoryIds.get(product.categorySlug);
     if (!categoryId) throw new Error(`Categoría faltante para ${product.name}.`);
     const [saved] = await sql<{ id: string }[]>`
-      insert into products (category_id, name, slug, short_description, description, image_key, image_alt, badge, base_price, tax_rate, is_active, sort_order)
-      values (${categoryId}, ${product.name}, ${product.slug}, ${product.shortDescription}, ${product.description}, ${product.imageKey}, ${product.imageAlt}, ${product.badge}, ${product.price}, 0.15, true, ${product.sortOrder})
+      insert into products (category_id, name, slug, short_description, image_key, image_alt, badge, base_price, tax_rate, is_active, sort_order)
+      values (${categoryId}, ${product.name}, ${product.slug}, ${product.shortDescription}, ${product.imageKey}, ${product.imageAlt}, ${product.badge}, ${product.price}, 0.15, true, ${product.sortOrder})
       on conflict (slug) do update set category_id = excluded.category_id, name = excluded.name,
-        short_description = excluded.short_description, description = excluded.description,
+        short_description = excluded.short_description,
         image_key = excluded.image_key, image_alt = excluded.image_alt, badge = excluded.badge,
         base_price = excluded.base_price, tax_rate = excluded.tax_rate, is_active = true,
         sort_order = excluded.sort_order
@@ -179,10 +179,10 @@ try {
         const optionDescription = "description" in option ? option.description : null;
         const optionLocked = "locked" in option ? option.locked : false;
         await sql`
-          insert into modifier_options (id, modifier_group_id, name, description, price_delta, is_default, is_active, sort_order, included_quantity, default_quantity, max_quantity, is_locked)
-          values (${option.id}, ${group.id}, ${option.name}, ${optionDescription}, ${option.price}, ${option.initial > 0}, true, ${optionIndex}, ${option.included}, ${option.initial}, ${option.max}, ${optionLocked})
+          insert into modifier_options (id, modifier_group_id, name, description, price_delta, is_active, sort_order, included_quantity, default_quantity, max_quantity, is_locked)
+          values (${option.id}, ${group.id}, ${option.name}, ${optionDescription}, ${option.price}, true, ${optionIndex}, ${option.included}, ${option.initial}, ${option.max}, ${optionLocked})
           on conflict (id) do update set modifier_group_id = excluded.modifier_group_id,
-            name = excluded.name, description = excluded.description, price_delta = excluded.price_delta, is_default = excluded.is_default,
+            name = excluded.name, description = excluded.description, price_delta = excluded.price_delta,
             is_active = true, sort_order = excluded.sort_order, included_quantity = excluded.included_quantity,
             default_quantity = excluded.default_quantity, max_quantity = excluded.max_quantity, is_locked = excluded.is_locked
         `;

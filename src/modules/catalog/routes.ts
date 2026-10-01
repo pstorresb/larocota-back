@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import type { AppEnv } from "../../config/env.js";
 import type { Database } from "../../db/client.js";
-import { readProductImage } from "../../common/storage/product-images.js";
+import { productImageUrls, readProductImage } from "../../common/storage/product-images.js";
 import { loadModifierGroups } from "./configuration.js";
 import { buildSlots } from "../cycles/slots.js";
 
@@ -56,9 +56,9 @@ export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       if (!cycleRow) return { cycle: null, categories: [], products: [] };
       const cycle = await decorateCycle(cycleRow);
       const products = await sql`
-        select p.id, p.name, p.slug, p.short_description as description, p.base_price, p.tax_rate,
-          p.image_key, p.image_alt, p.badge, p.updated_at,
-          c.id as category_id, c.name as category, c.slug as category_slug,
+        select p.id, p.name, p.short_description as description, p.base_price, p.tax_rate,
+          p.image_key, p.image_alt, p.badge,
+          c.id as category_id, c.name as category,
           cp.capacity, cp.price_override, cp.is_available,
           greatest(coalesce(cp.capacity, 2147483647) - coalesce(sum(sr.quantity) filter (where sr.status = 'committed' or (sr.status = 'reserved' and (sr.expires_at is null or sr.expires_at > now()))), 0), 0)::int as available
         from cycle_products cp
@@ -66,11 +66,11 @@ export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
         join categories c on c.id = p.category_id and c.is_active
         left join stock_reservations sr on sr.cycle_id = cp.cycle_id and sr.product_id = cp.product_id
         where cp.cycle_id = ${cycle.id} and cp.is_available
-        group by p.id, c.id, cp.capacity, cp.price_override, cp.is_available, cp.sort_order
-        order by c.sort_order, cp.sort_order, p.name
+        group by p.id, c.id, cp.capacity, cp.price_override, cp.is_available
+        order by c.sort_order, c.name, p.sort_order, p.name
       `;
       const categories = await sql`
-        select distinct c.id, c.name, c.slug, c.sort_order
+        select distinct c.id, c.name, c.sort_order
         from cycle_products cp join products p on p.id = cp.product_id join categories c on c.id = p.category_id
         where cp.cycle_id = ${cycle.id} and cp.is_available and p.is_active and c.is_active
         order by c.sort_order, c.name
@@ -79,9 +79,18 @@ export function catalogRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       return {
         cycle,
         categories,
+        // Explicit shape: internal columns (capacity, price override, storage key) stay on the server.
         products: products.map((product) => ({
-          ...product,
-          imageUrl: product.imageKey ? `/media/products/${encodeURIComponent(String(product.imageKey))}?v=${new Date(product.updatedAt as string | Date).getTime()}` : null,
+          id: product.id,
+          name: product.name,
+          description: product.description,
+          categoryId: product.categoryId,
+          category: product.category,
+          imageAlt: product.imageAlt,
+          badge: product.badge,
+          available: product.available,
+          ...productImageUrls(product.imageKey as string | null),
+          /** Final consumer price in cents, tax included. */
           basePriceCents: Math.round(Number(product.priceOverride ?? product.basePrice) * 100),
           taxRateBps: Math.round(Number(product.taxRate) * 10_000),
           modifierGroups: (modifierGroups.get(String(product.id)) ?? []).map((group) => ({

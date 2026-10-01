@@ -1,5 +1,6 @@
 import { randomInt } from "node:crypto";
 import type { Database } from "../../db/client.js";
+import { calculateLine } from "../../common/money.js";
 import { loadModifierGroups, resolveModifierSelection, type ModifierSelectionInput } from "../catalog/configuration.js";
 import { findSlot } from "../cycles/slots.js";
 
@@ -64,9 +65,11 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
     for (const item of input.items) {
       const [product] = await tx<{ id: string; name: string; basePrice: string; taxRate: string; priceOverride: string | null; capacity: number | null; isAvailable: boolean }[]>`
         select p.id, p.name, p.base_price, p.tax_rate, cp.price_override, cp.capacity, cp.is_available
-        from cycle_products cp join products p on p.id = cp.product_id
-        where cp.cycle_id = ${input.cycleId} and cp.product_id = ${item.productId} and p.is_active = true
-        for update
+        from cycle_products cp
+        join products p on p.id = cp.product_id and p.is_active
+        join categories c on c.id = p.category_id and c.is_active
+        where cp.cycle_id = ${input.cycleId} and cp.product_id = ${item.productId}
+        for update of cp
       `;
       if (!product || !product.isAvailable) throw Object.assign(new Error("Uno de los productos ya no está disponible."), { statusCode: 409 });
       const [{ reserved = 0 } = { reserved: 0 }] = await tx<{ reserved: number }[]>`
@@ -78,11 +81,10 @@ export async function submitOrder(sql: Database, input: CheckoutInput) {
       const unitBaseCents = Math.round(Number(product.priceOverride ?? product.basePrice) * 100);
       const modifierGroups = await loadModifierGroups(tx as unknown as Database, [product.id]);
       const modifiers = resolveModifierSelection(modifierGroups.get(product.id) ?? [], item.selections);
-      const unitTotalCents = unitBaseCents + modifiers.modifierCents;
-      const subtotalCents = unitTotalCents * item.quantity;
       const taxRateBps = Math.round(Number(product.taxRate) * 10_000);
-      const taxCents = Math.round((subtotalCents * taxRateBps) / 10_000);
-      prepared.push({ productId: product.id, name: product.name, quantity: item.quantity, unitBaseCents, modifierCents: modifiers.modifierCents, unitTotalCents, taxRateBps, taxCents, subtotalCents, totalCents: subtotalCents + taxCents, modifierSnapshot: modifiers.snapshot, note: item.customerNote });
+      // Prices are tax-inclusive: the line total is what the customer pays and the tax is the share inside it.
+      const line = calculateLine({ unitBaseCents, modifierCents: modifiers.modifierCents, quantity: item.quantity, taxRateBps });
+      prepared.push({ productId: product.id, name: product.name, quantity: item.quantity, unitBaseCents, modifierCents: modifiers.modifierCents, unitTotalCents: line.unitCents, taxRateBps, taxCents: line.taxCents, subtotalCents: line.subtotalCents, totalCents: line.totalCents, modifierSnapshot: modifiers.snapshot, note: item.customerNote });
     }
     const subtotalCents = prepared.reduce((sum, item) => sum + item.subtotalCents, 0);
     const taxCents = prepared.reduce((sum, item) => sum + item.taxCents, 0);

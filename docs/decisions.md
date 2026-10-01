@@ -7,7 +7,8 @@
 - Zona horaria de presentación: `America/Guayaquil`; persistencia temporal en UTC.
 - Modalidad inicial: retiro en Ibarra; cada ciclo define sus fechas y capacidad desde administración.
 - Franjas de entrega: cada ciclo define una ventana de entrega (`fulfillment_starts_at`–`fulfillment_ends_at`, máximo 24 h) dividida en franjas de 30 o 60 minutos con cupo opcional de pedidos por franja. Las franjas se calculan, no se guardan; el pedido registra la franja elegida (`orders.slot_starts_at`). El cliente elige franja tanto para retiro como para entrega; la hora ya no vive dentro de la dirección. Un pedido pendiente de pago ocupa su asiento hasta que el mantenimiento lo cancela.
-- IVA: configurable por producto; el backend persiste la tasa y conserva snapshots en cada orden.
+- IVA: configurable por producto (15 % o 0 %); el backend persiste la tasa y conserva snapshots en cada orden. Los precios son finales, con IVA incluido: el administrador escribe lo que paga el cliente y el sistema solo desglosa base e IVA en el checkout y en el pedido.
+- Productos: el orden de la lista de administración es el orden del menú; ocultar un producto o una categoría es un interruptor reversible y eliminar solo se permite cuando no hay pedidos. Las imágenes se optimizan al subir en dos tamaños WebP.
 - Pago: transferencia bancaria con comprobante JPG, PNG, WebP o PDF de hasta 8 MB. El checkout no publica identificación del titular; mostrará el número completo de cuenta únicamente cuando exista una cuenta real configurada.
 - Autenticación: sesión aleatoria guardada como hash; cookie `HttpOnly`, `SameSite=Lax` y `Secure` en producción.
 - Precios y cupos: el navegador muestra una vista previa; el backend recalcula y reserva dentro de una transacción.

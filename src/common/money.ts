@@ -1,3 +1,7 @@
+/**
+ * Prices are final consumer prices: the tax is already inside them.
+ * `unitBaseCents` and `modifierCents` are what the customer pays per unit; tax is the included share.
+ */
 export type MoneyLine = {
   unitBaseCents: number;
   modifierCents: number;
@@ -7,9 +11,10 @@ export type MoneyLine = {
 
 export function calculateLine(line: MoneyLine) {
   const unitCents = line.unitBaseCents + line.modifierCents;
-  const subtotalCents = unitCents * line.quantity;
-  const taxCents = Math.round((subtotalCents * line.taxRateBps) / 10_000);
-  return { unitCents, subtotalCents, taxCents, totalCents: subtotalCents + taxCents };
+  const totalCents = unitCents * line.quantity;
+  // Tax contained in a tax-inclusive amount: total × rate / (1 + rate), in basis points.
+  const taxCents = Math.round((totalCents * line.taxRateBps) / (10_000 + line.taxRateBps));
+  return { unitCents, subtotalCents: totalCents - taxCents, taxCents, totalCents };
 }
 
 export function calculateOrder(lines: MoneyLine[]) {

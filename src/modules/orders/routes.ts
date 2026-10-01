@@ -57,8 +57,10 @@ export function orderRoutes(sql: Database, env: AppEnv): FastifyPluginAsync { re
     const productIds = parsed.data.items.map((item) => item.productId);
     const products = await sql<{ id: string; basePrice: string; priceOverride: string | null; taxRate: string }[]>`
       select p.id, p.base_price, cp.price_override, p.tax_rate
-      from cycle_products cp join products p on p.id = cp.product_id
-      where cp.cycle_id = ${parsed.data.cycleId} and cp.is_available and p.is_active and p.id = any(${productIds}::uuid[])
+      from cycle_products cp
+      join products p on p.id = cp.product_id and p.is_active
+      join categories c on c.id = p.category_id and c.is_active
+      where cp.cycle_id = ${parsed.data.cycleId} and cp.is_available and p.id = any(${productIds}::uuid[])
     `;
     const byId = new Map(products.map((product) => [product.id, product]));
     const modifierGroups = await loadModifierGroups(sql, productIds);

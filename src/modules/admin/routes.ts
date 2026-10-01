@@ -3,7 +3,8 @@ import { hash as hashPassword } from "@node-rs/argon2";
 import { z } from "zod";
 import type { AppEnv } from "../../config/env.js";
 import type { Database } from "../../db/client.js";
-import { deleteUploadedProductImage, storeProductImage } from "../../common/storage/product-images.js";
+import { deleteUploadedProductImage, productImageUrls, storeProductImage } from "../../common/storage/product-images.js";
+import { uniqueSlug } from "../../common/slug.js";
 import { loadModifierGroups } from "../catalog/configuration.js";
 import { requireAdmin, requireSuperadmin } from "../auth/guards.js";
 import { assertTransition, orderStatuses, type OrderStatus } from "../orders/state-machine.js";
@@ -12,8 +13,40 @@ import { buildSlots } from "../cycles/slots.js";
 import { getSetting } from "../settings/service.js";
 import { sendOrderStatusEmail, type OrderFulfillmentInfo } from "../../common/email/resend.js";
 
-const categorySchema = z.object({ name: z.string().trim().min(2).max(80), slug: z.string().regex(/^[a-z0-9-]+$/).max(80), description: z.string().max(500).optional(), sortOrder: z.number().int().min(0).default(0), isActive: z.boolean().default(true) });
-const productSchema = z.object({ categoryId: z.string().uuid(), name: z.string().trim().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/).max(120), shortDescription: z.string().trim().min(5).max(300), description: z.string().max(2000).optional(), imageAlt: z.string().max(180).optional(), badge: z.string().max(40).optional(), basePrice: z.number().min(0).max(10000), taxRate: z.number().min(0).max(1), sortOrder: z.number().int().min(0).default(0), isActive: z.boolean().default(true) });
+/** Money and rates arrive as JS numbers; reject values that would be silently rounded by Postgres. */
+const decimals = (max: number) => (value: number) => Number.isInteger(Math.round(value * 10 ** max * 1e6) / 1e6);
+const categorySchema = z.object({
+  name: z.string().trim().min(2).max(80),
+  isActive: z.boolean().default(true),
+});
+// Update schemas are written out with no defaults: `.partial()` over a schema with `.default()` keeps the
+// defaults, so a partial PATCH would overwrite stored values (it used to reset order and reactivate records).
+export const categoryUpdateSchema = z.object({
+  name: z.string().trim().min(2).max(80).optional(),
+  isActive: z.boolean().optional(),
+}).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
+const productFields = {
+  categoryId: z.string().uuid("Elige una categoría."),
+  name: z.string().trim().min(2, "El nombre necesita al menos 2 letras.").max(120, "El nombre es demasiado largo."),
+  shortDescription: z.string().trim().min(5, "Describe el producto en al menos 5 letras.").max(300, "La descripción es demasiado larga."),
+  imageAlt: z.string().trim().max(180).optional(),
+  badge: z.string().trim().max(40).optional(),
+  /** Final consumer price, tax included. */
+  basePrice: z.number().min(0, "El precio no puede ser negativo.").max(10000, "El precio es demasiado alto.").refine(decimals(2), "El precio admite hasta 2 decimales."),
+  taxRate: z.number().min(0).max(1).refine(decimals(4), "La tasa de IVA no es válida."),
+};
+const productSchema = z.object({ ...productFields, isActive: z.boolean().default(true) });
+export const productUpdateSchema = z.object({
+  categoryId: productFields.categoryId.optional(),
+  name: productFields.name.optional(),
+  shortDescription: productFields.shortDescription.optional(),
+  imageAlt: productFields.imageAlt,
+  badge: productFields.badge,
+  basePrice: productFields.basePrice.optional(),
+  taxRate: productFields.taxRate.optional(),
+  isActive: z.boolean().optional(),
+}).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
+const orderSchema = z.object({ ids: z.array(z.string().uuid()).min(1).max(500) });
 const cycleBaseSchema = z.object({
   name: z.string().trim().min(2).max(120),
   opensAt: z.coerce.date(),
@@ -40,8 +73,6 @@ const cycleSchema = cycleBaseSchema.superRefine((value, context) => {
   const problem = validateCycleDates(value);
   if (problem) context.addIssue({ code: "custom", path: ["fulfillmentEndsAt"], message: problem });
 });
-const categoryUpdateSchema = categorySchema.partial().refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
-const productUpdateSchema = productSchema.partial().refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
 const cycleStatusSchema = z.enum(cycleStatuses);
 // Written out instead of `cycleBaseSchema.partial()`: partial() keeps the create defaults, so a status-only
 // PATCH would arrive with slotMinutes 60 and both capacities null and silently overwrite the cycle.
@@ -58,7 +89,7 @@ export const cycleUpdateSchema = z.object({
   publicMessage: z.string().max(500).nullable().optional(),
   status: cycleStatusSchema.optional(),
 }).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
-const cycleProductsSchema = z.object({ products: z.array(z.object({ productId: z.string().uuid(), capacity: z.number().int().positive().nullable().default(null), priceOverride: z.number().min(0).nullable().default(null), isAvailable: z.boolean().default(true), sortOrder: z.number().int().min(0).default(0) })).max(500) });
+const cycleProductsSchema = z.object({ products: z.array(z.object({ productId: z.string().uuid(), capacity: z.number().int().positive().nullable().default(null), priceOverride: z.number().min(0).max(10000).nullable().default(null), isAvailable: z.boolean().default(true), sortOrder: z.number().int().min(0).default(0) })).max(500) });
 const modifierOptionSchema = z.object({ id: z.string().uuid().optional(), name: z.string().trim().min(1).max(100), description: z.string().max(300).optional(), priceDelta: z.number().min(0).max(10000), includedQuantity: z.number().int().min(0).max(20), defaultQuantity: z.number().int().min(0).max(20), maxQuantity: z.number().int().min(1).max(20), isLocked: z.boolean().default(false), isActive: z.boolean().default(true), sortOrder: z.number().int().min(0).default(0) }).refine((option) => option.includedQuantity <= option.maxQuantity && option.defaultQuantity <= option.maxQuantity, "Las cantidades de una opción no son válidas.").refine((option) => !option.isLocked || (option.defaultQuantity > 0 && option.includedQuantity >= option.defaultQuantity), "Una opción fija debe estar incluida y preseleccionada.");
 const modifierGroupSchema = z.object({ id: z.string().uuid().optional(), name: z.string().trim().min(2).max(100), description: z.string().max(300).optional(), selectionType: z.enum(["single", "multiple"]), minSelections: z.number().int().min(0).max(50), maxSelections: z.number().int().min(1).max(50), isActive: z.boolean().default(true), sortOrder: z.number().int().min(0).default(0), options: z.array(modifierOptionSchema).max(100) }).superRefine((group, context) => {
   if (group.minSelections > group.maxSelections) context.addIssue({ code: "custom", message: "El mínimo no puede superar el máximo." });
@@ -89,6 +120,17 @@ const updateUserSchema = z.object({
   status: userStatusSchema.optional(),
 }).refine((value) => Object.keys(value).length > 0, "No hay cambios para guardar.");
 
+type AdminProductRow = {
+  id: string; categoryId: string; categoryName: string; categoryIsActive: boolean; name: string; shortDescription: string;
+  imageKey: string | null; imageAlt: string | null; badge: string | null; basePrice: string; taxRate: string;
+  sortOrder: number; isActive: boolean; createdAt: Date; modifierGroupCount: number;
+};
+
+function presentAdminProduct(row: AdminProductRow) {
+  const { imageKey, ...rest } = row;
+  return { ...rest, ...productImageUrls(imageKey) };
+}
+
 type OrderNotificationRow = {
   id: string; status: OrderStatus; orderNumber: string; fulfillmentType: string;
   contactSnapshot: { email: string; firstName: string };
@@ -98,6 +140,26 @@ type OrderNotificationRow = {
 
 export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
   return async (app) => {
+    /** Columns every admin product response uses, so list, create and update always agree. */
+    const adminProductColumns = sql`
+      p.id, p.category_id, c.name as category_name, c.is_active as category_is_active, p.name, p.short_description,
+      p.image_key, p.image_alt, p.badge, p.base_price, p.tax_rate, p.sort_order, p.is_active, p.created_at,
+      (select count(*) from modifier_groups mg where mg.product_id = p.id)::int as modifier_group_count
+    `;
+    async function loadAdminProduct(db: Database, productId: string, lock?: false): Promise<ReturnType<typeof presentAdminProduct>>;
+    async function loadAdminProduct(db: Database, productId: string, lock: true): Promise<ReturnType<typeof presentAdminProduct> | null>;
+    async function loadAdminProduct(db: Database, productId: string, lock = false) {
+      const [row] = await db<AdminProductRow[]>`
+        select ${adminProductColumns} from products p join categories c on c.id = p.category_id
+        where p.id = ${productId} ${lock ? db`for update of p` : db``}
+      `;
+      if (!row) {
+        if (lock) return null;
+        throw new Error("Product not found after write");
+      }
+      return presentAdminProduct(row);
+    }
+
     /** Slot and place for status emails; the pickup point comes from store settings, not from the order. */
     async function fulfillmentInfo(order: OrderNotificationRow): Promise<OrderFulfillmentInfo> {
       const pickup = order.fulfillmentType === "pickup" ? await getSetting(sql, "pickup") : null;
@@ -138,7 +200,7 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
     app.get("/admin/categories", async (request) => {
       await requireAdmin(sql, env, request);
       const categories = await sql`
-        select c.id, c.name, c.slug, c.description, c.sort_order, c.is_active, c.created_at,
+        select c.id, c.name, c.sort_order, c.is_active, c.created_at,
           count(p.id)::int as product_count
         from categories c left join products p on p.category_id = c.id
         group by c.id order by c.sort_order, c.name
@@ -148,13 +210,12 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
 
     app.get("/admin/products", async (request) => {
       await requireAdmin(sql, env, request);
-      const products = await sql`
-        select p.id, p.category_id, c.name as category_name, p.name, p.slug, p.short_description,
-          p.description, p.image_key, p.image_alt, p.badge, p.base_price, p.tax_rate, p.sort_order, p.is_active, p.created_at
+      const products = await sql<AdminProductRow[]>`
+        select ${adminProductColumns}
         from products p join categories c on c.id = p.category_id
-        order by p.sort_order, p.name
+        order by c.sort_order, c.name, p.sort_order, p.name
       `;
-      return { products };
+      return { products: products.map(presentAdminProduct) };
     });
 
     app.get<{ Params: { productId: string } }>("/admin/products/:productId/configuration", async (request, reply) => {
@@ -385,76 +446,167 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
     });
 
     app.post("/admin/categories", async (request, reply) => {
-      const user = await requireAdmin(sql, env, request); const parsed = categorySchema.safeParse(request.body);
-      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa la categoría." });
-      const [category] = await sql`insert into categories (name, slug, description, sort_order, is_active) values (${parsed.data.name}, ${parsed.data.slug}, ${parsed.data.description ?? null}, ${parsed.data.sortOrder}, ${parsed.data.isActive}) returning *`;
-      if (!category) throw new Error("Category creation failed");
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'category', ${category.id}, 'created', ${sql.json(category)})`;
-      return reply.code(201).send({ category });
+      const user = await requireAdmin(sql, env, request);
+      const parsed = categorySchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Escribe un nombre de al menos 2 letras para la categoría." });
+      const slug = await uniqueSlug(sql, "categories", parsed.data.name);
+      const category = await sql.begin(async (tx) => {
+        const [created] = await tx`
+          insert into categories (name, slug, sort_order, is_active)
+          values (${parsed.data.name}, ${slug}, (select coalesce(max(sort_order), 0) + 1 from categories), ${parsed.data.isActive})
+          returning id, name, sort_order, is_active, created_at
+        `;
+        if (!created) throw new Error("Category creation failed");
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'category', ${created.id}, 'created', ${tx.json(created)})`;
+        return created;
+      });
+      return reply.code(201).send({ category: { ...category, productCount: 0 } });
+    });
+
+    // Fixes the storefront order of categories: position in `ids` becomes sort_order.
+    app.put("/admin/categories/order", async (request, reply) => {
+      const user = await requireAdmin(sql, env, request);
+      const parsed = orderSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "El orden enviado no es válido." });
+      await sql.begin(async (tx) => {
+        await tx`update categories c set sort_order = v.position::int from unnest(${parsed.data.ids}::uuid[]) with ordinality as v(id, position) where c.id = v.id`;
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'category', null, 'reordered', ${tx.json(parsed.data.ids)})`;
+      });
+      return reply.code(204).send();
     });
 
     app.patch<{ Params: { categoryId: string } }>("/admin/categories/:categoryId", async (request, reply) => {
-      const user = await requireAdmin(sql, env, request); const parsed = categoryUpdateSchema.safeParse(request.body);
+      const user = await requireAdmin(sql, env, request);
+      const parsed = categoryUpdateSchema.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa la categoría." });
-      const [before] = await sql`select * from categories where id = ${request.params.categoryId}`;
-      if (!before) return reply.code(404).send({ code: "CATEGORY_NOT_FOUND", message: "Categoría no encontrada." });
-      const [category] = await sql`update categories set name = coalesce(${parsed.data.name ?? null}, name), slug = coalesce(${parsed.data.slug ?? null}, slug), description = case when ${parsed.data.description === ""} then null else coalesce(${parsed.data.description ?? null}, description) end, sort_order = coalesce(${parsed.data.sortOrder ?? null}, sort_order), is_active = coalesce(${parsed.data.isActive ?? null}, is_active) where id = ${before.id} returning *`;
-      if (!category) throw new Error("Category update failed");
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'category', ${before.id}, 'updated', ${sql.json(before)}, ${sql.json(category)})`;
+      const category = await sql.begin(async (tx) => {
+        const [before] = await tx`select id, name, sort_order, is_active from categories where id = ${request.params.categoryId} for update`;
+        if (!before) throw Object.assign(new Error("Categoría no encontrada."), { statusCode: 404, code: "CATEGORY_NOT_FOUND" });
+        const [after] = await tx`
+          update categories set name = coalesce(${parsed.data.name ?? null}, name), is_active = coalesce(${parsed.data.isActive ?? null}, is_active)
+          where id = ${before.id} returning id, name, sort_order, is_active, created_at
+        `;
+        if (!after) throw new Error("Category update failed");
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'category', ${before.id}, 'updated', ${tx.json(before)}, ${tx.json(after)})`;
+        return after;
+      });
       return { category };
     });
 
+    // Real delete, only for an empty category. Hiding a category from the store is a PATCH (isActive: false).
     app.delete<{ Params: { categoryId: string } }>("/admin/categories/:categoryId", async (request, reply) => {
       const user = await requireAdmin(sql, env, request);
-      const [category] = await sql`update categories set is_active = false where id = ${request.params.categoryId} returning id, name, is_active`;
-      if (!category) return reply.code(404).send({ code: "CATEGORY_NOT_FOUND", message: "Categoría no encontrada." });
-      await sql`update products set is_active = false where category_id = ${category.id}`;
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'category', ${category.id}, 'disabled', ${sql.json(category)})`;
+      await sql.begin(async (tx) => {
+        const [category] = await tx`select id, name from categories where id = ${request.params.categoryId} for update`;
+        if (!category) throw Object.assign(new Error("Categoría no encontrada."), { statusCode: 404, code: "CATEGORY_NOT_FOUND" });
+        const [{ products = 0 } = { products: 0 }] = await tx<{ products: number }[]>`select count(*)::int as products from products where category_id = ${category.id}`;
+        if (products > 0) throw Object.assign(new Error("Esta categoría tiene productos. Muévelos o elimínalos antes, o desactívala para ocultarla."), { statusCode: 409, code: "IN_USE" });
+        await tx`delete from categories where id = ${category.id}`;
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json) values (${user.id}, ${request.id}, 'category', ${category.id}, 'deleted', ${tx.json(category)})`;
+      });
       return reply.code(204).send();
     });
 
     app.post("/admin/products", async (request, reply) => {
-      const user = await requireAdmin(sql, env, request); const parsed = productSchema.safeParse(request.body);
-      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa el producto." });
-      const [product] = await sql`insert into products (category_id, name, slug, short_description, description, image_alt, badge, base_price, tax_rate, sort_order, is_active) values (${parsed.data.categoryId}, ${parsed.data.name}, ${parsed.data.slug}, ${parsed.data.shortDescription}, ${parsed.data.description ?? null}, ${parsed.data.imageAlt || null}, ${parsed.data.badge || null}, ${parsed.data.basePrice.toFixed(2)}, ${parsed.data.taxRate}, ${parsed.data.sortOrder}, ${parsed.data.isActive}) returning *`;
-      if (!product) throw new Error("Product creation failed");
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'product', ${product.id}, 'created', ${sql.json(product)})`;
+      const user = await requireAdmin(sql, env, request);
+      const parsed = productSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: parsed.error.issues[0]?.message ?? "Revisa el producto." });
+      const data = parsed.data;
+      const slug = await uniqueSlug(sql, "products", data.name);
+      const product = await sql.begin(async (tx) => {
+        const [category] = await tx`select id from categories where id = ${data.categoryId}`;
+        if (!category) throw Object.assign(new Error("La categoría elegida ya no existe."), { statusCode: 409, code: "CATEGORY_NOT_FOUND" });
+        const [created] = await tx<{ id: string }[]>`
+          insert into products (category_id, name, slug, short_description, image_alt, badge, base_price, tax_rate, sort_order, is_active)
+          values (${data.categoryId}, ${data.name}, ${slug}, ${data.shortDescription}, ${data.imageAlt || null}, ${data.badge || null}, ${data.basePrice.toFixed(2)}, ${data.taxRate},
+            (select coalesce(max(sort_order), 0) + 1 from products where category_id = ${data.categoryId}), ${data.isActive})
+          returning id
+        `;
+        if (!created) throw new Error("Product creation failed");
+        const row = await loadAdminProduct(tx as unknown as Database, created.id);
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'product', ${created.id}, 'created', ${tx.json(row)})`;
+        return row;
+      });
       return reply.code(201).send({ product });
     });
 
+    // Fixes the storefront order of products inside their category: position in `ids` becomes sort_order.
+    app.put("/admin/products/order", async (request, reply) => {
+      const user = await requireAdmin(sql, env, request);
+      const parsed = orderSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "El orden enviado no es válido." });
+      await sql.begin(async (tx) => {
+        await tx`update products p set sort_order = v.position::int from unnest(${parsed.data.ids}::uuid[]) with ordinality as v(id, position) where p.id = v.id`;
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'product', null, 'reordered', ${tx.json(parsed.data.ids)})`;
+      });
+      return reply.code(204).send();
+    });
+
     app.patch<{ Params: { productId: string } }>("/admin/products/:productId", async (request, reply) => {
-      const user = await requireAdmin(sql, env, request); const parsed = productUpdateSchema.safeParse(request.body);
-      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: "Revisa el producto." });
-      const [before] = await sql`select * from products where id = ${request.params.productId}`;
-      if (!before) return reply.code(404).send({ code: "PRODUCT_NOT_FOUND", message: "Producto no encontrado." });
-      const [product] = await sql`update products set category_id = coalesce(${parsed.data.categoryId ?? null}::uuid, category_id), name = coalesce(${parsed.data.name ?? null}, name), slug = coalesce(${parsed.data.slug ?? null}, slug), short_description = coalesce(${parsed.data.shortDescription ?? null}, short_description), description = case when ${parsed.data.description === ""} then null else coalesce(${parsed.data.description ?? null}, description) end, image_alt = case when ${parsed.data.imageAlt === ""} then null else coalesce(${parsed.data.imageAlt ?? null}, image_alt) end, badge = case when ${parsed.data.badge === ""} then null else coalesce(${parsed.data.badge ?? null}, badge) end, base_price = coalesce(${parsed.data.basePrice?.toFixed(2) ?? null}::numeric, base_price), tax_rate = coalesce(${parsed.data.taxRate ?? null}::numeric, tax_rate), sort_order = coalesce(${parsed.data.sortOrder ?? null}, sort_order), is_active = coalesce(${parsed.data.isActive ?? null}, is_active) where id = ${before.id} returning *`;
-      if (!product) throw new Error("Product update failed");
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'product', ${before.id}, 'updated', ${sql.json(before)}, ${sql.json(product)})`;
+      const user = await requireAdmin(sql, env, request);
+      const parsed = productUpdateSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: parsed.error.issues[0]?.message ?? "Revisa el producto." });
+      const data = parsed.data;
+      const product = await sql.begin(async (tx) => {
+        const before = await loadAdminProduct(tx as unknown as Database, request.params.productId, true);
+        if (!before) throw Object.assign(new Error("Producto no encontrado."), { statusCode: 404, code: "PRODUCT_NOT_FOUND" });
+        if (data.categoryId) {
+          const [category] = await tx`select id from categories where id = ${data.categoryId}`;
+          if (!category) throw Object.assign(new Error("La categoría elegida ya no existe."), { statusCode: 409, code: "CATEGORY_NOT_FOUND" });
+        }
+        await tx`
+          update products set
+            category_id = coalesce(${data.categoryId ?? null}::uuid, category_id),
+            name = coalesce(${data.name ?? null}, name),
+            short_description = coalesce(${data.shortDescription ?? null}, short_description),
+            image_alt = case when ${data.imageAlt === ""} then null else coalesce(${data.imageAlt ?? null}, image_alt) end,
+            badge = case when ${data.badge === ""} then null else coalesce(${data.badge ?? null}, badge) end,
+            base_price = coalesce(${data.basePrice?.toFixed(2) ?? null}::numeric, base_price),
+            tax_rate = coalesce(${data.taxRate ?? null}::numeric, tax_rate),
+            is_active = coalesce(${data.isActive ?? null}, is_active)
+          where id = ${before.id}
+        `;
+        const after = await loadAdminProduct(tx as unknown as Database, before.id);
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'product', ${before.id}, 'updated', ${tx.json(before)}, ${tx.json(after)})`;
+        return after;
+      });
       return { product };
     });
 
     app.post<{ Params: { productId: string } }>("/admin/products/:productId/image", async (request, reply) => {
       const user = await requireAdmin(sql, env, request);
-      const [before] = await sql`select id, name, image_key from products where id = ${request.params.productId}`;
+      const [before] = await sql<{ id: string; name: string; imageKey: string | null }[]>`select id, name, image_key from products where id = ${request.params.productId}`;
       if (!before) return reply.code(404).send({ code: "PRODUCT_NOT_FOUND", message: "Producto no encontrado." });
       const file = await request.file();
       if (!file) return reply.code(400).send({ code: "IMAGE_REQUIRED", message: "Selecciona una imagen." });
       const stored = await storeProductImage({ buffer: await file.toBuffer(), uploadDir: env.UPLOAD_DIR });
-      const [product] = await sql`update products set image_key = ${stored.imageKey} where id = ${before.id} returning id, image_key, image_alt`;
-      if (!product) throw new Error("Product image update failed");
-      await deleteUploadedProductImage(env.UPLOAD_DIR, before.imageKey as string | null);
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'product', ${before.id}, 'image_replaced', ${sql.json(before)}, ${sql.json(product)})`;
+      let product;
+      try {
+        product = await sql.begin(async (tx) => {
+          await tx`update products set image_key = ${stored.imageKey} where id = ${before.id}`;
+          const after = await loadAdminProduct(tx as unknown as Database, before.id);
+          await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'product', ${before.id}, 'image_replaced', ${tx.json({ imageKey: before.imageKey })}, ${tx.json({ imageKey: stored.imageKey })})`;
+          return after;
+        });
+      } catch (error) {
+        // The row was not updated: do not leave the new files orphaned on disk.
+        await deleteUploadedProductImage(env.UPLOAD_DIR, stored.imageKey).catch(() => undefined);
+        throw error;
+      }
+      // The change is committed; a failure removing the old files must not fail the request.
+      await deleteUploadedProductImage(env.UPLOAD_DIR, before.imageKey).catch((error) => request.log.warn({ err: error, imageKey: before.imageKey }, "could not remove replaced product image"));
       return { product };
     });
 
     app.delete<{ Params: { productId: string } }>("/admin/products/:productId/image", async (request, reply) => {
       const user = await requireAdmin(sql, env, request);
-      const [before] = await sql`select id, image_key from products where id = ${request.params.productId}`;
+      const [before] = await sql<{ id: string; imageKey: string | null }[]>`select id, image_key from products where id = ${request.params.productId}`;
       if (!before) return reply.code(404).send({ code: "PRODUCT_NOT_FOUND", message: "Producto no encontrado." });
-      const [product] = await sql`update products set image_key = null where id = ${before.id} returning id, image_key, image_alt`;
-      if (!product) throw new Error("Product image removal failed");
-      await deleteUploadedProductImage(env.UPLOAD_DIR, before.imageKey as string | null);
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'product', ${product.id}, 'image_removed', ${sql.json(product)})`;
+      await sql.begin(async (tx) => {
+        await tx`update products set image_key = null where id = ${before.id}`;
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'product', ${before.id}, 'image_removed', ${tx.json({ imageKey: before.imageKey })}, ${tx.json({ imageKey: null })})`;
+      });
+      await deleteUploadedProductImage(env.UPLOAD_DIR, before.imageKey).catch((error) => request.log.warn({ err: error, imageKey: before.imageKey }, "could not remove product image"));
       return reply.code(204).send();
     });
 
@@ -462,15 +614,17 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
       const user = await requireAdmin(sql, env, request);
       const parsed = productConfigurationSchema.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ code: "VALIDATION_ERROR", message: parsed.error.issues[0]?.message ?? "Revisa la configuración del producto.", details: parsed.error.flatten() });
-      const [product] = await sql`select id, name from products where id = ${request.params.productId}`;
-      if (!product) return reply.code(404).send({ code: "PRODUCT_NOT_FOUND", message: "Producto no encontrado." });
-      await sql.begin(async (tx) => {
+      const productId = await sql.begin(async (tx) => {
+        // Row lock: two admins saving the same product at once must not interleave their group upserts.
+        const [product] = await tx<{ id: string }[]>`select id from products where id = ${request.params.productId} for update`;
+        if (!product) throw Object.assign(new Error("Producto no encontrado."), { statusCode: 404, code: "PRODUCT_NOT_FOUND" });
+        const before = (await loadModifierGroups(tx as unknown as Database, [product.id], true)).get(product.id) ?? [];
         const savedGroupIds: string[] = [];
         for (const group of parsed.data.groups) {
           let groupId = group.id;
           if (groupId) {
             const [updated] = await tx`update modifier_groups set name = ${group.name}, description = ${group.description || null}, selection_type = ${group.selectionType}, min_selections = ${group.minSelections}, max_selections = ${group.maxSelections}, is_active = ${group.isActive}, sort_order = ${group.sortOrder} where id = ${groupId} and product_id = ${product.id} returning id`;
-            if (!updated) throw Object.assign(new Error("Uno de los grupos ya no pertenece a este producto."), { statusCode: 409 });
+            if (!updated) throw Object.assign(new Error("Uno de los grupos ya no pertenece a este producto. Recarga e inténtalo de nuevo."), { statusCode: 409 });
           } else {
             const [created] = await tx`insert into modifier_groups (product_id, name, description, selection_type, min_selections, max_selections, is_active, sort_order) values (${product.id}, ${group.name}, ${group.description || null}, ${group.selectionType}, ${group.minSelections}, ${group.maxSelections}, ${group.isActive}, ${group.sortOrder}) returning id`;
             if (!created) throw new Error("Modifier group creation failed");
@@ -481,30 +635,43 @@ export function adminRoutes(sql: Database, env: AppEnv): FastifyPluginAsync {
           for (const option of group.options) {
             let optionId = option.id;
             if (optionId) {
-              const [updated] = await tx`update modifier_options set name = ${option.name}, description = ${option.description || null}, price_delta = ${option.priceDelta.toFixed(2)}, included_quantity = ${option.includedQuantity}, default_quantity = ${option.defaultQuantity}, max_quantity = ${option.maxQuantity}, is_locked = ${option.isLocked}, is_default = ${option.defaultQuantity > 0}, is_active = ${option.isActive}, sort_order = ${option.sortOrder} where id = ${optionId} and modifier_group_id = ${groupId} returning id`;
-              if (!updated) throw Object.assign(new Error("Una de las opciones ya no pertenece a este grupo."), { statusCode: 409 });
+              const [updated] = await tx`update modifier_options set name = ${option.name}, description = ${option.description || null}, price_delta = ${option.priceDelta.toFixed(2)}, included_quantity = ${option.includedQuantity}, default_quantity = ${option.defaultQuantity}, max_quantity = ${option.maxQuantity}, is_locked = ${option.isLocked}, is_active = ${option.isActive}, sort_order = ${option.sortOrder} where id = ${optionId} and modifier_group_id = ${groupId} returning id`;
+              if (!updated) throw Object.assign(new Error("Una de las opciones ya no pertenece a este grupo. Recarga e inténtalo de nuevo."), { statusCode: 409 });
             } else {
-              const [created] = await tx`insert into modifier_options (modifier_group_id, name, description, price_delta, included_quantity, default_quantity, max_quantity, is_locked, is_default, is_active, sort_order) values (${groupId}, ${option.name}, ${option.description || null}, ${option.priceDelta.toFixed(2)}, ${option.includedQuantity}, ${option.defaultQuantity}, ${option.maxQuantity}, ${option.isLocked}, ${option.defaultQuantity > 0}, ${option.isActive}, ${option.sortOrder}) returning id`;
+              const [created] = await tx`insert into modifier_options (modifier_group_id, name, description, price_delta, included_quantity, default_quantity, max_quantity, is_locked, is_active, sort_order) values (${groupId}, ${option.name}, ${option.description || null}, ${option.priceDelta.toFixed(2)}, ${option.includedQuantity}, ${option.defaultQuantity}, ${option.maxQuantity}, ${option.isLocked}, ${option.isActive}, ${option.sortOrder}) returning id`;
               if (!created) throw new Error("Modifier option creation failed");
               optionId = String(created.id);
             }
             savedOptionIds.push(optionId);
           }
+          // Placed orders keep their own snapshot, so removing options never rewrites history.
           await tx`delete from modifier_options where modifier_group_id = ${groupId} and not (id = any(${savedOptionIds}::uuid[]))`;
         }
         await tx`delete from modifier_groups where product_id = ${product.id} and not (id = any(${savedGroupIds}::uuid[]))`;
-        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'product', ${product.id}, 'configuration_replaced', ${tx.json(parsed.data.groups)})`;
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json, after_json) values (${user.id}, ${request.id}, 'product', ${product.id}, 'configuration_replaced', ${tx.json(before)}, ${tx.json(parsed.data.groups)})`;
+        return product.id;
       });
-      const groups = await loadModifierGroups(sql, [String(product.id)], true);
-      return { groups: groups.get(String(product.id)) ?? [] };
+      const groups = await loadModifierGroups(sql, [productId], true);
+      return { groups: groups.get(productId) ?? [] };
     });
 
+    // Real delete, only for a product nobody ordered. Hiding a product from the store is a PATCH (isActive: false).
     app.delete<{ Params: { productId: string } }>("/admin/products/:productId", async (request, reply) => {
       const user = await requireAdmin(sql, env, request);
-      const [product] = await sql`update products set is_active = false where id = ${request.params.productId} returning id, name, is_active`;
-      if (!product) return reply.code(404).send({ code: "PRODUCT_NOT_FOUND", message: "Producto no encontrado." });
-      await sql`update cycle_products set is_available = false where product_id = ${product.id}`;
-      await sql`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, after_json) values (${user.id}, ${request.id}, 'product', ${product.id}, 'disabled', ${sql.json(product)})`;
+      const removed = await sql.begin(async (tx) => {
+        const [product] = await tx<{ id: string; name: string; imageKey: string | null }[]>`select id, name, image_key from products where id = ${request.params.productId} for update`;
+        if (!product) throw Object.assign(new Error("Producto no encontrado."), { statusCode: 404, code: "PRODUCT_NOT_FOUND" });
+        const [{ used = 0 } = { used: 0 }] = await tx<{ used: number }[]>`
+          select ((select count(*) from order_items where product_id = ${product.id}) + (select count(*) from stock_reservations where product_id = ${product.id}))::int as used
+        `;
+        if (used > 0) throw Object.assign(new Error("Este producto ya tiene pedidos. Desactívalo para ocultarlo de la tienda."), { statusCode: 409, code: "IN_USE" });
+        await tx`delete from cycle_products where product_id = ${product.id}`;
+        await tx`delete from modifier_groups where product_id = ${product.id}`;
+        await tx`delete from products where id = ${product.id}`;
+        await tx`insert into audit_events (actor_user_id, request_id, entity_type, entity_id, action, before_json) values (${user.id}, ${request.id}, 'product', ${product.id}, 'deleted', ${tx.json(product)})`;
+        return product;
+      });
+      await deleteUploadedProductImage(env.UPLOAD_DIR, removed.imageKey).catch((error) => request.log.warn({ err: error, imageKey: removed.imageKey }, "could not remove deleted product image"));
       return reply.code(204).send();
     });
 

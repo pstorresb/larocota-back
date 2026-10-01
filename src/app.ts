@@ -13,6 +13,18 @@ import { paymentRoutes } from "./modules/payments/routes.js";
 import { adminRoutes } from "./modules/admin/routes.js";
 import { settingsRoutes } from "./modules/settings/routes.js";
 
+/**
+ * Constraint violations and malformed ids are the client's doing, not a server fault: answer 4xx with a
+ * Spanish message instead of a masked 500. Handlers that can say something more specific still should.
+ */
+function translateDatabaseError(error: Error & { statusCode?: number; code?: unknown }) {
+  if (error.statusCode || error.name !== "PostgresError") return error;
+  if (error.code === "23505") return Object.assign(new Error("Ya existe un registro con esos datos."), { statusCode: 409, code: "DUPLICATE" });
+  if (error.code === "23503") return Object.assign(new Error("No se puede completar: el registro está en uso o hace referencia a algo que ya no existe."), { statusCode: 409, code: "IN_USE" });
+  if (error.code === "22P02") return Object.assign(new Error("Registro no encontrado."), { statusCode: 404, code: "NOT_FOUND" });
+  return error;
+}
+
 export async function buildApp(env: AppEnv) {
   const app = Fastify({
     logger: { level: env.LOG_LEVEL },
@@ -29,7 +41,7 @@ export async function buildApp(env: AppEnv) {
 
   // Must be set before registering plugins: each plugin snapshots the parent's error handler when it is created.
   app.setErrorHandler((error, request, reply) => {
-    const appError = error as Error & { statusCode?: number; code?: unknown };
+    const appError = translateDatabaseError(error as Error & { statusCode?: number; code?: unknown });
     const statusCode = appError.statusCode && appError.statusCode < 500 ? appError.statusCode : 500;
     if (statusCode >= 500) request.log.error({ err: error }, "request failed");
     else request.log.warn({ err: error }, "request rejected");
